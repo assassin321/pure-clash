@@ -9,8 +9,8 @@ license = "GPL-3.0"
 # 相对可执行文件解析；/usr/bin 软链由维护脚本创建。随包内核版本目录升级时
 # 需同步更新两段 assets 中的 kernel/1.19.30 路径（唯一来源仍是 manifest）。
 [package.metadata.deb]
-maintainer = "Ztion <work@ztion.cn>"
-copyright = "2026 Ztion"
+maintainer = "assassin321 <zhiqu@cock.li>"
+copyright = "2026 assassin321"
 depends = "$auto"
 section = "net"
 priority = "optional"
@@ -38,7 +38,7 @@ maintainer-scripts = "packaging/linux/deb"
 
 [package.metadata.generate-rpm]
 summary = "A lightweight native Mihomo desktop client built with Rust and Zed GPUI"
-maintainer = "Ztion <work@ztion.cn>"
+maintainer = "assassin321 <zhiqu@cock.li>"
 post_install_script = "packaging/linux/rpm/post-install.sh"
 pre_uninstall_script = "packaging/linux/rpm/pre-uninstall.sh"
 post_uninstall_script = "packaging/linux/rpm/post-uninstall.sh"

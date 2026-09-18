@@ -431,7 +431,7 @@ rules:
         use crate::mihomo::MihomoProcess;
         use crate::mihomo::controller::Mode;
 
-        const SUBSCRIPTION_URL: &str = "https://p.ztion.cc/clash/Ztion-Net";
+        const SUBSCRIPTION_URL: &str = "https://p.example.com/clash/token";
 
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
