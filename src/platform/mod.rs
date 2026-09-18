@@ -510,6 +510,7 @@ mod tests {
         let options = main_window_options(Bounds::default());
         assert!(options.titlebar.is_none());
         assert!(options.window_decorations.is_none());
+    }
         
     #[test]
     fn portable_mode_overrides_paths() {
