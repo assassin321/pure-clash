@@ -105,7 +105,7 @@ fn main() {
 
         // 业务实体与进程同生命周期；窗口关闭和重建都复用它，避免重复启动内核及轮询。
         let show_window = startup_mode.show_initial_window();  // 先提取值
-        let runtime = cx.new(|cx| Puremeta::new(loaded_config, startup_mode, cx));
+        let runtime = cx.new(|cx| PureClash::new(loaded_config, startup_mode, cx));
         let shell = AppShell::install(runtime, cx);
         shell.update(cx, |shell, cx| {
             shell.start(show_window, cx)
