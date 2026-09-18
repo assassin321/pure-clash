@@ -94,7 +94,7 @@ impl StartupMode {
     }
 
     pub(crate) fn is_autostart(&self) -> bool {
-        self == Self::Autostart
+        *self == Self::Autostart
     }
     
     /// 获取便携模式的数据目录
