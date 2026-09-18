@@ -45,6 +45,36 @@ install -m 644 "$root/geodata/GeoSite.dat" "$root/geodata/GeoIP.dat" \
 install -m 644 "$root/packaging/linux/pure-clash.desktop" "$appdir/usr/share/applications/"
 install -m 644 "$root/packaging/linux/pure-clash.png" \
     "$appdir/usr/share/icons/hicolor/64x64/apps/pure-clash.png"
+    
+# ===== 便携模式入口 =====
+# AppImage 挂载后，AppRun 所在目录是 $APPDIR/usr，
+# 真正的二进制在 $APPDIR/usr/bin/pure-clash。
+# 便携数据放在「AppImage 文件同级目录的 PureClashPortable/」里，
+# 这样 U 盘 / ~/Apps / /mnt/usb 都能带走。
+cat > "$appdir/AppRun" << 'APPEND'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# AppImage 运行时：APPDIR=/tmp/.mount_xxx/usr
+APPDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# APPDIR 通常是 .../usr，程序在 .../usr/bin
+BIN_DIR="$APPDIR/bin"
+
+# AppImage 本体的绝对路径（不是挂载路径）
+ORIGINAL="${APPIMAGE:-$(readlink -f "$0")}"
+
+# 便携目录：和 AppImage 文件放在同一目录下的 PureClashData/
+PORTABLE_DIR="$(dirname "$ORIGINAL")/PureClashData"
+
+if [ -d "$PORTABLE_DIR" ] || [ -f "$(dirname "$ORIGINAL")/pure-clash.portable" ]; then
+    export PURE_Clash_PORTABLE_DIR="$PORTABLE_DIR"
+    mkdir -p "$PORTABLE_DIR/config" "$PORTABLE_DIR/data" "$PORTABLE_DIR/cache"
+fi
+
+exec "$BIN_DIR/pure-clash" "$@"
+APPEND
+
+chmod +x "$appdir/AppRun"
 
 cd "$root/target/appimage"
 # linuxdeploy 在 APPIMAGE_EXTRACT_AND_RUN=1 下可能把产物写到 $HOME 而非当前

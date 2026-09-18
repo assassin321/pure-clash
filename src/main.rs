@@ -65,6 +65,24 @@ fn main() {
         logging::init(&paths.log_dir);
     }
 
+    // 便携模式路径覆盖
+    if let Some(data_dir) = startup_mode.portable_data_dir() {
+        let config_dir = data_dir.join("config");
+        let data_dir_path = data_dir.join("data");
+        let cache_dir = data_dir.join("cache");
+        
+        let _ = std::fs::create_dir_all(&config_dir);
+        let _ = std::fs::create_dir_all(&data_dir_path);
+        let _ = std::fs::create_dir_all(&cache_dir);
+        
+        platform::override_app_paths(&config_dir, &data_dir_path, &cache_dir);
+    }
+
+    // 然后才是 config::load_or_create()
+    if let Ok(paths) = platform::AppPaths::from_current_exe() {
+        logging::init(&paths.log_dir);
+    }
+
     // 平台模块统一解析配置和资源路径，避免依赖可能被快捷方式改变的工作目录。
     let loaded_config = config::load_or_create().unwrap_or_else(|error| {
         log_error!("app", "初始化 Pure Clash 配置失败：{error:#}");

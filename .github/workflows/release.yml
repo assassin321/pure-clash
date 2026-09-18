@@ -46,7 +46,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.zip
           if-no-files-found: error
 
   linux:
@@ -118,6 +120,7 @@ jobs:
           # artifact 下载后保留 debian/ 等子目录，glob 需要跨层级匹配。
           files: |
             release/**/*.exe
+            release/**/*.zip
             release/**/*.deb
             release/**/*.rpm
             release/**/*.AppImage

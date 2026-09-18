@@ -273,6 +273,57 @@ try {
     }
 
     Write-Host "安装包已生成：$installerOutput"
+    
+    # ===== 生成便携版 zip =====
+    Write-Host "正在生成便携版..." -ForegroundColor Green
+    $portableDir = Join-Path $projectRoot "dist\portable"
+    Remove-Item -Recurse -Force $portableDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
+
+    # 复制可执行文件
+    Copy-Item -LiteralPath $appExe -Destination (Join-Path $portableDir "pure-clash.exe")
+
+    # 复制内核文件
+    $kernelPortableDir = Join-Path $portableDir "kernel\$kernelVersion"
+    New-Item -ItemType Directory -Path $kernelPortableDir -Force | Out-Null
+    Copy-Item -LiteralPath $kernelExe -Destination (Join-Path $kernelPortableDir $kernelBinaryName)
+    Copy-Item -LiteralPath $kernelLicense -Destination (Join-Path $kernelPortableDir "LICENSE")
+    Copy-Item -LiteralPath $kernelNotice -Destination (Join-Path $kernelPortableDir "NOTICE.md")
+    Copy-Item -LiteralPath $kernelManifest -Destination (Join-Path $kernelPortableDir "manifest.json")
+
+    if ($wintunSource) {
+        Copy-Item -LiteralPath $wintunSource -Destination (Join-Path $kernelPortableDir (Split-Path -Leaf $wintunSource))
+    }
+
+    $geodataPortableDir = Join-Path $portableDir "geodata"
+    New-Item -ItemType Directory -Path $geodataPortableDir -Force | Out-Null
+    foreach ($geoFile in $geodataPayloads) {
+        Copy-Item -LiteralPath $geoFile -Destination (Join-Path $geodataPortableDir (Split-Path -Leaf $geoFile))
+    }
+    Copy-Item -LiteralPath $geodataManifest -Destination (Join-Path $geodataPortableDir "manifest.json")
+    Copy-Item -LiteralPath $geodataLicense -Destination (Join-Path $geodataPortableDir "LICENSE")
+    Copy-Item -LiteralPath $geodataNotice -Destination (Join-Path $geodataPortableDir "NOTICE.md")
+
+    New-Item -ItemType File -Path (Join-Path $portableDir "portable.flag") | Out-Null
+
+    $batContent = @"
+@echo off
+set PURE_CLASH_PORTABLE_DIR=%~dp0Data
+start "" "%~dp0pure-clash.exe"
+"@
+    $batPath = Join-Path $portableDir "Start-PureClash.bat"
+    [IO.File]::WriteAllText($batPath, $batContent, [Text.UTF8Encoding]::new($false))
+
+    $zipPath = Join-Path $distDir "pure-clash-$version-windows-x64-portable.zip"
+    if (Test-Path -LiteralPath $zipPath) {
+        Remove-Item -LiteralPath $zipPath -Force
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::CreateFromDirectory($portableDir, $zipPath)
+
+    Remove-Item -Recurse -Force $portableDir
+
+    Write-Host "便携版已生成：$zipPath" -ForegroundColor Green
 }
 finally {
     Pop-Location

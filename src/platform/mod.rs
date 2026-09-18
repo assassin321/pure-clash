@@ -1,11 +1,24 @@
 use std::path::{Path, PathBuf};
 
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use directories::ProjectDirs;
 use gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 #[cfg(target_os = "linux")]
 use gpui::{Pixels, WindowBackgroundAppearance, WindowDecorations};
+
+/// 便携模式路径覆盖
+#[derive(Debug, Clone)]
+struct PortablePathOverride {
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    cache_dir: PathBuf,
+}
+
+/// 线程安全的全局便携模式路径覆盖
+static PORTABLE_PATHS: OnceLock<PortablePathOverride> = OnceLock::new();
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 compile_error!("Pure Clash 当前只规划 Windows、Linux 和 macOS 平台");
@@ -96,6 +109,24 @@ pub(crate) fn tun_stack() -> &'static str {
     {
         "mixed"
     }
+}
+
+/// 便携模式：覆盖应用的标准路径（在 config::load_or_create() 之前调用）
+pub(crate) fn override_app_paths(
+    config_dir: &Path,
+    data_dir: &Path,
+    cache_dir: &Path,
+) {
+    let _ = PORTABLE_PATHS.set(PortablePathOverride {
+        config_dir: config_dir.to_path_buf(),
+        data_dir: data_dir.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+    });
+}
+
+/// 检查是否处于便携模式
+pub(crate) fn is_portable_mode() -> bool {
+    PORTABLE_PATHS.get().is_some()
 }
 
 /// Linux 使用与 Clash Verge Rev 一致的双栈 fake-IP；Windows 维持已有的
@@ -268,6 +299,29 @@ impl AppPaths {
         let executable = std::env::current_exe().context("无法确定 Pure Clash 可执行文件路径")?;
         let program_dir = executable.parent().context("可执行文件路径缺少父目录")?;
 
+        // ===== 新增：检查便携模式覆盖 =====
+        if let Some(portable) = PORTABLE_PATHS.get() {
+            let config_dir = &portable.config_dir;
+            let data_dir = &portable.data_dir;
+            let mihomo_config_dir = config_dir.join("mihomo");
+            return Ok(Self {
+                program_dir: program_dir.to_path_buf(),
+                config_file: config_dir.join("app.json"),
+                default_mihomo_config_file: mihomo_config_dir.join("default.yaml"),
+                local_mihomo_config_file: mihomo_config_dir.join("local.yaml"),
+                runtime_mihomo_config_file: mihomo_config_dir.join("runtime.yaml"),
+                profiles_dir: config_dir.join("profiles"),
+                mihomo_config_dir,
+                mihomo_data_dir: data_dir.join("mihomo"),
+                config_dir: config_dir.clone(),
+                data_dir: data_dir.clone(),
+                log_dir: data_dir.join("log"),  // 便携模式下日志放到 data/log/
+                kernel_dir: program_dir.join("kernel"),
+                geodata_resource_dir: program_dir.join("geodata"),
+            });
+        }
+        // ===== 新增结束 =====
+
         #[cfg(target_os = "windows")]
         {
             // Windows 当前采用 per-user 安装，安装目录可写，保持程序同级目录约定。
@@ -282,8 +336,6 @@ impl AppPaths {
             let config_dir = project_dirs.config_dir().to_path_buf();
             let data_dir = project_dirs.data_local_dir().to_path_buf();
             let mihomo_config_dir = config_dir.join("mihomo");
-            // 日志属于会话状态：Linux 按 XDG_STATE_HOME 标准放 ~/.local/state；
-            // macOS 无 state 约定时退回本地数据目录下的 log/。
             let log_dir = project_dirs
                 .state_dir()
                 .map(|dir| dir.join("log"))
@@ -458,5 +510,25 @@ mod tests {
         let options = main_window_options(Bounds::default());
         assert!(options.titlebar.is_none());
         assert!(options.window_decorations.is_none());
+        
+    #[test]
+    fn portable_mode_overrides_paths() {
+        // 清除之前的覆盖（测试环境中）
+        // 注意：OnceLock 只能设置一次，测试需要按顺序运行
+        
+        let config_dir = PathBuf::from("/tmp/test-portable/config");
+        let data_dir = PathBuf::from("/tmp/test-portable/data");
+        let cache_dir = PathBuf::from("/tmp/test-portable/cache");
+        
+        override_app_paths(&config_dir, &data_dir, &cache_dir);
+        
+        assert!(is_portable_mode());
+        
+        let paths = AppPaths::from_current_exe().unwrap();
+        assert_eq!(paths.config_dir, config_dir);
+        assert_eq!(paths.data_dir, data_dir);
+        assert_eq!(paths.config_file, config_dir.join("app.json"));
+        assert_eq!(paths.log_dir, data_dir.join("log"));
+        assert_eq!(paths.mihomo_data_dir, data_dir.join("mihomo"));
     }
 }
