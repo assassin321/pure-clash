@@ -85,7 +85,9 @@ jobs:
           export PATH="$PWD:$PATH"
           # 第一个参数是内核版本目录名（与 manifest 一致），第二个是包版本
           # （用于 AppImage 文件名）。
-          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "pure-clash") | .version')"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "pure-meta") | .version')"
+          # 给构建脚本添加可执行权限
+          chmod +x ./packaging/linux/build-appimage.sh
           ./packaging/linux/build-appimage.sh "$(jq -r '.version' kernel/*/manifest.json)" "$package_version"
       - uses: actions/upload-artifact@v4
         with:
