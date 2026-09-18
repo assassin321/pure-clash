@@ -84,20 +84,20 @@ impl StartupMode {
     }
 
     /// 只有用户主动启动才立即创建窗口；后台自启等待托盘或第二实例唤起。
-    pub(crate) fn show_initial_window(self) -> bool {
+    pub(crate) fn show_initial_window(&self) -> bool {
         matches!(self, Self::Interactive)
     }
 
     /// 后台自启不能干扰已经运行的实例，尤其不能在登录时意外弹出窗口。
-    pub(crate) fn notify_existing_instance(self) -> bool {
+    pub(crate) fn notify_existing_instance(&self) -> bool {
         matches!(self, Self::Interactive | Self::Portable(_))
     }
 
-    pub(crate) fn is_autostart(self) -> bool {
+    pub(crate) fn is_autostart(&self) -> bool {
         self == Self::Autostart
     }
     
-    /// ✅ 获取便携模式的数据目录
+    /// 获取便携模式的数据目录
     pub(crate) fn portable_data_dir(&self) -> Option<&PathBuf> {
         if let Self::Portable(dir) = self {
             Some(dir)
