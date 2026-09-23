@@ -1,0 +1,138 @@
+[package]
+name = "pure-clash"
+version = "0.2.7"
+edition = "2024"
+description = "A lightweight Mihomo desktop client built with Rust and Zed GPUI"
+license = "GPL-3.0"
+
+# Linux 发行包布局：程序与随包内核整体放在 /opt/pure-clash，保证内核目录
+# 相对可执行文件解析；/usr/bin 软链由维护脚本创建。随包内核版本目录升级时
+# 需同步更新两段 assets 中的 kernel/1.19.30 路径（唯一来源仍是 manifest）。
+[package.metadata.deb]
+maintainer = "assassin321 <zhiqu@cock.li>"
+copyright = "2026 assassin321"
+depends = "$auto"
+section = "net"
+priority = "optional"
+extended-description = """\
+Pure Clash is a lightweight native Mihomo desktop client built with \
+Rust and Zed GPUI. It manages configuration subscriptions, proxy \
+groups, connections and live traffic, and safely controls a standalone \
+Mihomo kernel with system proxy and TUN support."""
+assets = [
+    ["target/release/pure-clash", "opt/pure-clash/", "755"],
+    ["kernel/1.19.30/pc-mihomo", "opt/pure-clash/kernel/1.19.30/", "755"],
+    ["kernel/1.19.30/LICENSE", "opt/pure-clash/kernel/1.19.30/", "644"],
+    ["kernel/1.19.30/NOTICE.md", "opt/pure-clash/kernel/1.19.30/", "644"],
+    ["kernel/1.19.30/manifest.json", "opt/pure-clash/kernel/1.19.30/", "644"],
+    ["geodata/GeoSite.dat", "opt/pure-clash/geodata/", "644"],
+    ["geodata/GeoIP.dat", "opt/pure-clash/geodata/", "644"],
+    ["geodata/Country.mmdb", "opt/pure-clash/geodata/", "644"],
+    ["geodata/manifest.json", "opt/pure-clash/geodata/", "644"],
+    ["geodata/LICENSE", "opt/pure-clash/geodata/", "644"],
+    ["geodata/NOTICE.md", "opt/pure-clash/geodata/", "644"],
+    ["packaging/linux/pure-clash.desktop", "usr/share/applications/", "644"],
+    ["packaging/linux/pure-clash.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+]
+maintainer-scripts = "packaging/linux/deb"
+
+[package.metadata.generate-rpm]
+summary = "A lightweight native Mihomo desktop client built with Rust and Zed GPUI"
+maintainer = "assassin321 <zhiqu@cock.li>"
+post_install_script = "packaging/linux/rpm/post-install.sh"
+pre_uninstall_script = "packaging/linux/rpm/pre-uninstall.sh"
+post_uninstall_script = "packaging/linux/rpm/post-uninstall.sh"
+assets = [
+    { source = "target/release/pure-clash", dest = "/opt/pure-clash/pure-clash", mode = "755" },
+    { source = "kernel/1.19.30/pc-mihomo", dest = "/opt/pure-clash/kernel/1.19.30/pc-mihomo", mode = "755" },
+    { source = "kernel/1.19.30/LICENSE", dest = "/opt/pure-clash/kernel/1.19.30/LICENSE", mode = "644" },
+    { source = "kernel/1.19.30/NOTICE.md", dest = "/opt/pure-clash/kernel/1.19.30/NOTICE.md", mode = "644" },
+    { source = "kernel/1.19.30/manifest.json", dest = "/opt/pure-clash/kernel/1.19.30/manifest.json", mode = "644" },
+    { source = "geodata/GeoSite.dat", dest = "/opt/pure-clash/geodata/GeoSite.dat", mode = "644" },
+    { source = "geodata/GeoIP.dat", dest = "/opt/pure-clash/geodata/GeoIP.dat", mode = "644" },
+    { source = "geodata/Country.mmdb", dest = "/opt/pure-clash/geodata/Country.mmdb", mode = "644" },
+    { source = "geodata/manifest.json", dest = "/opt/pure-clash/geodata/manifest.json", mode = "644" },
+    { source = "geodata/LICENSE", dest = "/opt/pure-clash/geodata/LICENSE", mode = "644" },
+    { source = "geodata/NOTICE.md", dest = "/opt/pure-clash/geodata/NOTICE.md", mode = "644" },
+    { source = "packaging/linux/pure-clash.desktop", dest = "/usr/share/applications/pure-clash.desktop", mode = "644" },
+    { source = "packaging/linux/pure-clash.png", dest = "/usr/share/icons/hicolor/64x64/apps/pure-clash.png", mode = "644" },
+]
+
+[dependencies]
+anyhow = "1.0"
+# 托盘事件经无界通道转交 GPUI 主线程，避免在平台回调线程里直接操作界面状态。
+async-channel = "2.5"
+gpui = {
+    # GPUI 位于 Zed monorepo；固定稳定版 tag 对应提交，确保 Linux
+    # 零窗口存活的 QuitMode API 与构建结果可复现。
+    git = "https://github.com/zed-industries/zed.git",
+    rev = "c8e44cfa7bda9b2e22c8d6934d78969352e7f61a"
+}
+# 最新 GPUI 将平台后端工厂放在同一 monorepo 的 gpui_platform 包中。
+gpui_platform = {
+    git = "https://github.com/zed-industries/zed.git",
+    rev = "c8e44cfa7bda9b2e22c8d6934d78969352e7f61a",
+    # gpui_platform 默认不启用 Linux 窗口后端；显式同时编译 Wayland/X11，
+    # 运行时按当前会话选择，Wayland 不可用时仍可回退 X11。
+    features = ["wayland", "x11"]
+}
+# 日志时间戳：本地时区格式化，与 Mihomo logrus 输出、journalctl 展示一致。
+jiff = "0.2"
+rust-i18n = "4.2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# 解析与合并 Clash YAML 配置；锁定 0.9 稳定版本。
+serde_yaml = "0.9"
+# 校验随包与在线更新的 Geo 数据，防止损坏文件进入运行目录。
+sha2 = "0.10"
+# 订阅下载与 controller REST 调用；rustls TLS，阻塞式跑在 GPUI 后台线程。
+ureq = { version = "2.10", features = ["json"] }
+# 生成配置文件随机 secret 与订阅 profile 标识。
+uuid = { version = "1.0", features = ["v4"] }
+# 文本输入组件的字素边界处理（与 gpui 官方 input 示例一致）。
+unicode-segmentation = "1.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# GPUI 0.2.2 尚未提供系统托盘 API，仅在 Windows 目标引入成熟的原生托盘实现。
+tray-icon = { version = "0.24.2", default-features = false }
+# Windows 平台使用 Job Object 管理内核进程，并用命名 Mutex/Event 实现单实例；
+# 注册表与 WinINet 用于读写当前用户的系统代理设置。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinInet",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# 从 GPUI Window 解析原始 HWND，实现关闭到托盘的隐藏与恢复。
+raw-window-handle = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+# platform 层向内核发送 SIGTERM 优雅停止；Linux 还用 prctl 设置父进程死亡信号。
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux 托盘走 SNI/DBus 协议；ksni 是纯 Rust 实现，不依赖 GTK 与系统库。
+ksni = { version = "0.3", features = ["blocking"] }
+# 解码随包提交的托盘 PNG；与 ksni 内部的 image 版本一致，不重复编译。
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Linux/macOS 使用系统标准用户目录；Windows 当前保持安装目录旁的便携式布局。
+directories = "6.0"
+
+[build-dependencies]
+serde_json = "1.0"
+# 构建期按 geodata manifest 复核随包文件。
+sha2 = "0.10"
+# Windows 构建将多分辨率 ICO 编入可执行文件，供 GPUI 窗口和系统快捷方式读取。
+winresource = { version = "0.1.31", default-features = false }
+
+[profile.release]
+lto = "thin"
+strip = true

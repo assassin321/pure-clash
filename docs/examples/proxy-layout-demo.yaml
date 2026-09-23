@@ -1,0 +1,173 @@
+# Issue #2 代理页布局验证配置；适用于随包 Mihomo v1.19.30。
+# 导入：配置 → 导入本地 YAML；激活后切到代理页，使用规则模式。
+# 35 个假节点使用文档保留网段 192.0.2.0/24，密码和 UUID 均为演示值。
+# 这些节点无法代理上网，测速应超时；YAML 不能预填真实的测速历史。
+# MATCH,DIRECT 让规则模式的普通流量保持直连；请在验证后切回原配置。
+# 验证：首次进入、测速中/超时、切换选中节点、折叠展开、调整窗口、切换中英文。
+# 新加坡 9 项占三整行；香港 8 项的末行两项应保持列宽；单节点组也不应拉伸。
+# 自动选择/故障转移各 35 项，默认折叠，可展开后验证“显示更多”。
+
+mode: rule # 按 rules 选择出站；保持代理组列表可见。
+log-level: warning # 仅记录警告及错误，减少假节点失败日志。
+
+# 每项是一个假代理：name=界面名称；type=协议；server=保留示例 IPv4；
+# port=服务器端口（1..65535）；password=Hysteria2/Trojan 演示密码；
+# uuid=VLESS 演示用户标识（标准 UUID）；tls=true 表示 VLESS 使用 TLS。
+proxies:
+  - { name: "SG【亚洲】新加坡01丨直连", type: hysteria2, server: 192.0.2.1, port: 443, password: "layout-demo-only" }
+  - { name: "SG【亚洲】新加坡02丨直连", type: hysteria2, server: 192.0.2.2, port: 443, password: "layout-demo-only" }
+  - { name: "SG【亚洲】新加坡03丨直连", type: hysteria2, server: 192.0.2.3, port: 443, password: "layout-demo-only" }
+  - { name: "SG【亚洲】新加坡04丨直连", type: hysteria2, server: 192.0.2.4, port: 443, password: "layout-demo-only" }
+  - { name: "SG【亚洲】新加坡01丨Vless", type: vless, server: 192.0.2.5, port: 443, uuid: "00000000-0000-4000-8000-000000000001", tls: true }
+  - { name: "SG【亚洲】新加坡02丨Vless", type: vless, server: 192.0.2.6, port: 443, uuid: "00000000-0000-4000-8000-000000000001", tls: true }
+  - { name: "SG【亚洲】新加坡07丨V6【1x】", type: trojan, server: 192.0.2.7, port: 443, password: "layout-demo-only" }
+  - { name: "SG【亚洲】新加坡08丨V6【1x】超长节点名称用于验证窗口缩放与省略号", type: trojan, server: 192.0.2.8, port: 443, password: "layout-demo-only" }
+  - { name: "HK【亚洲】香港01丨直连", type: hysteria2, server: 192.0.2.9, port: 443, password: "layout-demo-only" }
+  - { name: "HK【亚洲】香港02丨直连", type: hysteria2, server: 192.0.2.10, port: 443, password: "layout-demo-only" }
+  - { name: "HK【亚洲】香港03丨直连", type: hysteria2, server: 192.0.2.11, port: 443, password: "layout-demo-only" }
+  - { name: "HK【亚洲】香港04丨直连", type: hysteria2, server: 192.0.2.12, port: 443, password: "layout-demo-only" }
+  - { name: "HK【亚洲】香港05原生丨移动直连", type: vless, server: 192.0.2.13, port: 443, uuid: "00000000-0000-4000-8000-000000000001", tls: true }
+  - { name: "HK【亚洲】香港01丨V6【1x】", type: trojan, server: 192.0.2.14, port: 443, password: "layout-demo-only" }
+  - { name: "HK【亚洲】香港02丨V6【1x】", type: trojan, server: 192.0.2.15, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本01丨东京专线【1x】", type: hysteria2, server: 192.0.2.16, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本02丨东京专线【1x】", type: hysteria2, server: 192.0.2.17, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本03丨东京专线【1x】", type: hysteria2, server: 192.0.2.18, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本04丨东京专线【1x】", type: hysteria2, server: 192.0.2.19, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本05丨东京专线【1x】", type: hysteria2, server: 192.0.2.20, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本06丨东京专线【1x】", type: hysteria2, server: 192.0.2.21, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本07丨东京专线【1x】", type: hysteria2, server: 192.0.2.22, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本08丨东京专线【1x】", type: hysteria2, server: 192.0.2.23, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本09丨东京专线【1x】", type: hysteria2, server: 192.0.2.24, port: 443, password: "layout-demo-only" }
+  - { name: "JP【亚洲】日本10丨东京专线【1x】", type: hysteria2, server: 192.0.2.25, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国01丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.26, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国02丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.27, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国03丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.28, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国04丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.29, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国05丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.30, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国06丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.31, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国07丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.32, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国08丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.33, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国09丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.34, port: 443, password: "layout-demo-only" }
+  - { name: "US【美洲】美国10丨洛杉矶超长名称专线【流媒体解锁测试】", type: hysteria2, server: 192.0.2.35, port: 443, password: "layout-demo-only" }
+
+# 组字段：name=组名；type=select 手选/url-test 最低延迟/fallback 顺序回退；
+# proxies=按显示顺序排列的节点或组名，DIRECT 为内置直连出站；
+# url=健康检查地址；interval=检查周期（秒）；lazy=true 允许未使用时跳过周期检查。
+proxy-groups:
+  - name: "自动选择"
+    type: url-test
+    url: "https://www.gstatic.com/generate_204"
+    interval: 3600
+    lazy: true
+    proxies:
+      - "SG【亚洲】新加坡01丨直连"
+      - "SG【亚洲】新加坡02丨直连"
+      - "SG【亚洲】新加坡03丨直连"
+      - "SG【亚洲】新加坡04丨直连"
+      - "SG【亚洲】新加坡01丨Vless"
+      - "SG【亚洲】新加坡02丨Vless"
+      - "SG【亚洲】新加坡07丨V6【1x】"
+      - "SG【亚洲】新加坡08丨V6【1x】超长节点名称用于验证窗口缩放与省略号"
+      - "HK【亚洲】香港01丨直连"
+      - "HK【亚洲】香港02丨直连"
+      - "HK【亚洲】香港03丨直连"
+      - "HK【亚洲】香港04丨直连"
+      - "HK【亚洲】香港05原生丨移动直连"
+      - "HK【亚洲】香港01丨V6【1x】"
+      - "HK【亚洲】香港02丨V6【1x】"
+      - "JP【亚洲】日本01丨东京专线【1x】"
+      - "JP【亚洲】日本02丨东京专线【1x】"
+      - "JP【亚洲】日本03丨东京专线【1x】"
+      - "JP【亚洲】日本04丨东京专线【1x】"
+      - "JP【亚洲】日本05丨东京专线【1x】"
+      - "JP【亚洲】日本06丨东京专线【1x】"
+      - "JP【亚洲】日本07丨东京专线【1x】"
+      - "JP【亚洲】日本08丨东京专线【1x】"
+      - "JP【亚洲】日本09丨东京专线【1x】"
+      - "JP【亚洲】日本10丨东京专线【1x】"
+      - "US【美洲】美国01丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国02丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国03丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国04丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国05丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国06丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国07丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国08丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国09丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国10丨洛杉矶超长名称专线【流媒体解锁测试】"
+  - name: "故障转移"
+    type: fallback
+    url: "https://www.gstatic.com/generate_204"
+    interval: 3600
+    lazy: true
+    proxies:
+      - "SG【亚洲】新加坡01丨直连"
+      - "SG【亚洲】新加坡02丨直连"
+      - "SG【亚洲】新加坡03丨直连"
+      - "SG【亚洲】新加坡04丨直连"
+      - "SG【亚洲】新加坡01丨Vless"
+      - "SG【亚洲】新加坡02丨Vless"
+      - "SG【亚洲】新加坡07丨V6【1x】"
+      - "SG【亚洲】新加坡08丨V6【1x】超长节点名称用于验证窗口缩放与省略号"
+      - "HK【亚洲】香港01丨直连"
+      - "HK【亚洲】香港02丨直连"
+      - "HK【亚洲】香港03丨直连"
+      - "HK【亚洲】香港04丨直连"
+      - "HK【亚洲】香港05原生丨移动直连"
+      - "HK【亚洲】香港01丨V6【1x】"
+      - "HK【亚洲】香港02丨V6【1x】"
+      - "JP【亚洲】日本01丨东京专线【1x】"
+      - "JP【亚洲】日本02丨东京专线【1x】"
+      - "JP【亚洲】日本03丨东京专线【1x】"
+      - "JP【亚洲】日本04丨东京专线【1x】"
+      - "JP【亚洲】日本05丨东京专线【1x】"
+      - "JP【亚洲】日本06丨东京专线【1x】"
+      - "JP【亚洲】日本07丨东京专线【1x】"
+      - "JP【亚洲】日本08丨东京专线【1x】"
+      - "JP【亚洲】日本09丨东京专线【1x】"
+      - "JP【亚洲】日本10丨东京专线【1x】"
+      - "US【美洲】美国01丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国02丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国03丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国04丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国05丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国06丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国07丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国08丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国09丨洛杉矶超长名称专线【流媒体解锁测试】"
+      - "US【美洲】美国10丨洛杉矶超长名称专线【流媒体解锁测试】"
+  - name: "新加坡节点"
+    type: select
+    proxies:
+      - "宝可梦"
+      - "SG【亚洲】新加坡01丨直连"
+      - "SG【亚洲】新加坡02丨直连"
+      - "SG【亚洲】新加坡03丨直连"
+      - "SG【亚洲】新加坡04丨直连"
+      - "SG【亚洲】新加坡01丨Vless"
+      - "SG【亚洲】新加坡02丨Vless"
+      - "SG【亚洲】新加坡07丨V6【1x】"
+      - "SG【亚洲】新加坡08丨V6【1x】超长节点名称用于验证窗口缩放与省略号"
+  - name: "香港节点"
+    type: select
+    proxies:
+      - "宝可梦"
+      - "HK【亚洲】香港01丨直连"
+      - "HK【亚洲】香港02丨直连"
+      - "HK【亚洲】香港03丨直连"
+      - "HK【亚洲】香港04丨直连"
+      - "HK【亚洲】香港05原生丨移动直连"
+      - "HK【亚洲】香港01丨V6【1x】"
+      - "HK【亚洲】香港02丨V6【1x】"
+  - name: "宝可梦"
+    type: select
+    proxies:
+      - "DIRECT"
+  - name: "单节点末行验证"
+    type: select
+    proxies:
+      - "US【美洲】美国10丨洛杉矶超长名称专线【流媒体解锁测试】"
+
+# 规则元素格式：匹配类型,出站；MATCH 匹配全部请求，这里固定直连。
+rules:
+  - MATCH,DIRECT

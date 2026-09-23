@@ -1,0 +1,3148 @@
+use gpui::{
+    AnyElement, App, ClickEvent, Context, Entity, IntoElement, PathPromptOptions, Render,
+    SharedString, Styled, Window, div, prelude::*, px, rgb,
+};
+use rust_i18n::t;
+
+use crate::{
+    assets::{
+        ICON_EYE, ICON_EYE_OFF, ICON_FILE_CODE, ICON_GIT_BRANCH, ICON_INFO, ICON_LAYOUT,
+        ICON_MESSAGE, ICON_SETTINGS,
+    },
+    config::{AppConfig, Language, LoadedConfig, ProfileMeta},
+    kernel::is_available,
+    mihomo::{
+        MihomoProcess,
+        config::NodeEndpoint,
+        config::ensure_baseline,
+        config::merge_runtime,
+        config::read_node_endpoints,
+        config::read_proxy_group_order,
+        config::save_baseline,
+        config::validate_kernel_config,
+        config::write_runtime,
+        controller::{
+            ConnectionItem, ConnectionsSnapshot, Controller, GroupSnapshot, Mode, NodeSnapshot,
+        },
+        geodata::{GeodataInfo, UpdateOutcome},
+    },
+    platform::{
+        AppPaths, AutoStartStatus, SystemProxySnapshot, autostart_status, capture_system_proxy,
+        restore_system_proxy, set_autostart, set_system_proxy,
+    },
+    profile,
+    startup::StartupMode,
+    theme::{FontWeightExt, Palette},
+    ui::TextInput,
+};
+
+impl PureClash {
+    /// 应用当前版本；与 Cargo 包版本保持一致，供更新检查比较。
+    pub(crate) const CURRENT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+}
+
+/// 超过该节点数的代理分组默认折叠，避免大订阅进入代理页时一次性布局全部节点。
+const PROXY_AUTO_COLLAPSE_NODES: usize = 30;
+
+/// 未手动操作时允许自动展开的节点总量上界；超出后其余分组默认折叠。
+const PROXY_AUTO_EXPAND_NODE_BUDGET: usize = 120;
+
+/// 代理节点卡片一行展示的列数。
+const PROXY_NODE_COLUMNS: u16 = 3;
+
+/// 展开分组单页渲染的节点数上限；大分组通过“显示更多”分页浏览，
+/// 让单次布局量有硬上界，同时滚动只保留页面一层。
+const PROXY_NODE_PAGE_SIZE: usize = 30;
+
+mod about;
+mod connections;
+mod frame;
+mod header;
+mod overview;
+mod profiles;
+mod proxies;
+mod settings;
+mod shell;
+mod sidebar;
+
+pub(crate) use shell::AppShell;
+
+#[cfg(target_os = "linux")]
+use frame::linux_client_side_decorations;
+use frame::render_titlebar;
+use header::render_page;
+use proxies::group_auto_expanded;
+use sidebar::render_sidebar;
+
+/// 应用侧边栏中的基础页面，覆盖日常代理管理的最小闭环。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Overview,
+    Proxies,
+    Connections,
+    Profiles,
+    Settings,
+    About,
+}
+
+impl Page {
+    fn all() -> [Self; 5] {
+        [
+            Self::Overview,
+            Self::Proxies,
+            Self::Connections,
+            Self::Profiles,
+            Self::Settings,
+        ]
+    }
+
+    fn label(self) -> SharedString {
+        match self {
+            Self::Overview => tr("page.overview"),
+            Self::Proxies => tr("page.proxies"),
+            Self::Connections => tr("page.connections"),
+            Self::Profiles => tr("page.profiles"),
+            Self::Settings => tr("page.settings"),
+            Self::About => tr("page.about"),
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Overview => ICON_LAYOUT,
+            Self::Proxies => ICON_GIT_BRANCH,
+            Self::Connections => ICON_MESSAGE,
+            Self::Profiles => ICON_FILE_CODE,
+            Self::Settings => ICON_SETTINGS,
+            Self::About => ICON_INFO,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyMode {
+    Rule,
+    Global,
+    Direct,
+}
+
+impl ProxyMode {
+    fn label(self) -> SharedString {
+        match self {
+            Self::Rule => tr("mode.rule"),
+            Self::Global => tr("mode.global"),
+            Self::Direct => tr("mode.direct"),
+        }
+    }
+
+    fn detail(self) -> SharedString {
+        match self {
+            Self::Rule => tr("mode.rule_detail"),
+            Self::Global => tr("mode.global_detail"),
+            Self::Direct => tr("mode.direct_detail"),
+        }
+    }
+
+    fn from_controller(mode: Mode) -> Self {
+        match mode {
+            Mode::Rule => Self::Rule,
+            Mode::Global => Self::Global,
+            Mode::Direct => Self::Direct,
+        }
+    }
+
+    fn to_controller(self) -> Mode {
+        match self {
+            Self::Rule => Mode::Rule,
+            Self::Global => Mode::Global,
+            Self::Direct => Mode::Direct,
+        }
+    }
+}
+
+/// 内核运行状态；Starting 表示进程已拉起，正在等待 controller 就绪。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreState {
+    Stopped,
+    Starting,
+    Running,
+}
+
+/// 开关的可见状态；Starting 表示授权/内核初始化尚未完成，不等同于已开启。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchState {
+    Off,
+    Starting,
+    On,
+}
+
+impl From<bool> for SwitchState {
+    fn from(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+}
+
+impl SwitchState {
+    fn label(self) -> SharedString {
+        tr(match self {
+            Self::Off => "status.off",
+            Self::Starting => "status.starting",
+            Self::On => "status.on",
+        })
+    }
+}
+
+/// 停机后不得显示旧状态，内核启动阶段不得提前显示 TUN 已开启。
+fn tun_visible_state(core_state: CoreState, state: SwitchState) -> SwitchState {
+    match core_state {
+        CoreState::Stopped => SwitchState::Off,
+        CoreState::Starting if state != SwitchState::Off => SwitchState::Starting,
+        _ => state,
+    }
+}
+
+/// Windows 没有常驻提权服务，登录恢复 TUN 必须允许 UAC；Linux 登录阶段只允许
+/// 访问已安装服务，避免桌面刚登录就弹出 polkit。
+fn startup_allows_interactive_elevation(startup_mode: StartupMode) -> bool {
+    cfg!(target_os = "windows") || !startup_mode.is_autostart()
+}
+
+/// 应用外壳用于刷新平台托盘的完整文案快照。
+pub(super) struct TrayTexts {
+    pub(super) tooltip: String,
+    pub(super) open: String,
+    pub(super) quit: String,
+}
+
+/// 连接页单次渲染的最大行数；超出部分提示条数，避免超大订阅拖慢布局。
+const CONNECTIONS_RENDER_LIMIT: usize = 200;
+/// 实时连接与流量的轮询间隔；与内核 dashboard 的默认推送节奏一致。
+const CONNECTIONS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// 订阅自动更新调度器的检查间隔；到期判断是墙钟比较，跳频只影响响应速度。
+const PROFILE_UPDATE_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) struct PureClash {
+    page: Page,
+    /// 启动时读取并在应用内持续维护的主配置对象。
+    config: AppConfig,
+    /// 当前平台的程序、配置、数据和内核目录集合。
+    paths: AppPaths,
+    /// 仅表示配置所选版本的内核文件存在，不代表 Mihomo 进程已经运行。
+    kernel_available: bool,
+    /// 当前由应用持有的真实 Mihomo 子进程，释放时会自动停止。
+    mihomo_process: Option<MihomoProcess>,
+    core_state: CoreState,
+    /// 每次启动或停止都递增；后台返回的旧启动结果必须立即回收，不能覆盖新状态。
+    core_start_generation: u64,
+    /// UAC 尚未返回时合并配置重启请求，避免并发弹出多个授权窗口。
+    core_restart_pending: bool,
+    /// 最近一次内核启停错误，直接展示在运行状态卡片中。
+    mihomo_error: Option<String>,
+    system_proxy: bool,
+    /// 本地基线中持久化的 TUN 期望值，决定下一次内核是否请求 TUN 权限。
+    tun_configured: bool,
+    /// TUN 授权与初始化全过程的状态；只有 controller 确认后才进入 On。
+    tun_state: SwitchState,
+    /// 登录自启状态始终来自平台配置，不复制到 `app.json`，避免与系统启动管理器分叉。
+    autostart_enabled: bool,
+    /// macOS 等尚未实现平台注册的平台显示禁用态，不能响应开关操作。
+    autostart_available: bool,
+    /// Linux 登录自启阶段为 false，避免弹 polkit；Windows 允许恢复已配置 TUN
+    /// 所必需的 UAC。无交互启动失败时会关闭 TUN 配置并回退普通内核。
+    interactive_elevation_allowed: bool,
+    /// 运行模式；与 controller 同步，未运行时保持上次已知值。
+    mode: ProxyMode,
+    /// controller 返回的真实策略组快照；内核未运行时为空。
+    groups: Vec<GroupSnapshot>,
+    /// 运行配置请求失败边沿标记；与连接轮询独立，避免一条请求吞掉另一条日志。
+    runtime_state_failing: bool,
+    /// 连接轮询失败边沿标记：只在失败开始与恢复时各记一条日志。
+    connections_failing: bool,
+    /// controller 轮询到的活跃连接（按建立时间序）；内核停止时清空。
+    connections: Vec<ConnectionItem>,
+    /// 实时上传/下载速度与会话累计字节数；由相邻连接快照差分得出。
+    traffic_down_speed: u64,
+    traffic_up_speed: u64,
+    download_total: u64,
+    upload_total: u64,
+    /// 延迟测试进行中的节点名集合；测速按钮据此显示忙态。
+    delay_testing: std::collections::HashSet<String>,
+    /// 手动测速覆盖的节点延迟（毫秒）；优先于 /proxies 自带的历史值。
+    node_delays: std::collections::HashMap<String, u64>,
+    /// 手动测速失败的节点（超时/拒绝）；下次成功测速或停内核时清除。
+    node_delay_failures: std::collections::HashSet<String>,
+    /// 订阅/导入配置的元数据；内容按 id 存放在 profiles 目录。
+    profiles: Vec<ProfileMeta>,
+    /// 当前激活的配置 id；None 表示使用内置默认配置。
+    active_profile: Option<String>,
+    /// 本地基线；controller 地址与 secret 的唯一来源。
+    baseline: Option<crate::mihomo::config::LocalBaseline>,
+    /// 配置页内联表单。
+    profile_form_open: bool,
+    profile_form_name: Entity<TextInput>,
+    profile_form_url: Entity<TextInput>,
+    /// 行内链接编辑使用独立输入实体，避免覆盖添加表单尚未提交的链接。
+    profile_edit_url: Entity<TextInput>,
+    /// 配置页后台任务忙态提示；非空时禁用相关操作。
+    profile_busy: Option<String>,
+    profile_error: Option<String>,
+    /// 正在自动更新的配置 id；与手动操作（profile_busy）互斥。
+    /// 自动更新静默执行，不占用 profile_busy 以免打扰界面。
+    auto_update_in_flight: Option<String>,
+    /// 行内编辑链接与更新间隔的配置下标；None 表示未在编辑。
+    editing_profile_index: Option<usize>,
+    /// 行内编辑自动更新间隔的输入框。
+    profile_form_interval: Entity<TextInput>,
+    /// 登录自启、系统代理与 TUN 的操作失败提示，展示在设置页与概览页。
+    integration_error: Option<String>,
+    /// 当前已安装 Geo 数据的官方提交与更新时间。
+    geodata_info: GeodataInfo,
+    /// 设置页手动更新 Geo 数据的后台忙态。
+    geodata_updating: bool,
+    /// 最近一次 Geo 数据更新结果，仅在设置页展示。
+    geodata_status: Option<SharedString>,
+    /// 代理页数据拉取中。
+    proxies_loading: bool,
+    /// 分组手动折叠状态（组名 → 是否展开）；未记录的组按节点数自动决定。
+    group_expanded: std::collections::HashMap<String, bool>,
+    /// 分组已翻页渲染的节点数（组名 → 数量）；未记录的组只渲染首页。
+    group_page: std::collections::HashMap<String, usize>,
+    /// 节点接入信息（协议/服务器/端口），来自 runtime.yaml，按节点名索引。
+    node_endpoints: std::collections::HashMap<String, NodeEndpoint>,
+    /// 概览页服务器地址是否明文展示；默认打码，眼睛图标切换。
+    server_visible: bool,
+    /// 关于页检查更新是否进行中。
+    update_checking: bool,
+    /// 检查发现新版本时置位；界面用它强调更新提示。
+    update_available: bool,
+    /// 关于页检查更新的结果文案；None 表示尚未检查。
+    update_status: Option<SharedString>,
+}
+
+impl PureClash {
+    pub(crate) fn new(
+        loaded_config: LoadedConfig,
+        startup_mode: StartupMode,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let LoadedConfig {
+            mut config,
+            paths,
+            geodata_info,
+        } = loaded_config;
+        // 启动时以 AppConfig 指定的版本确定当前内核路径和可用状态。
+        let kernel_available = is_available(&paths, &config.mihomo_version);
+        log_info!(
+            "app",
+            "Pure Clash v{} 启动（{}，内核 {}，{}）",
+            Self::CURRENT_VERSION,
+            if startup_mode.is_autostart() {
+                "登录自启"
+            } else {
+                "交互启动"
+            },
+            config.mihomo_version,
+            std::env::consts::OS,
+        );
+
+        // 本地基线提供 controller 地址与 secret；失败时仅禁用在线功能。
+        let mut baseline = match ensure_baseline(&paths) {
+            Ok(baseline) => Some(baseline),
+            Err(error) => {
+                log_error!("core", "初始化本地基线失败：{error:#}");
+                None
+            }
+        };
+        // 强制进程名开关以 app.json 为唯一事实来源：启动时把开关对齐到基线，
+        // 后续 runtime 生成的 `find-process-mode` 便与界面状态一致。
+        if let Some(baseline) = baseline.as_mut()
+            && baseline.find_process_always != config.find_process_always
+        {
+            baseline.find_process_always = config.find_process_always;
+            if let Err(error) = save_baseline(&paths, baseline) {
+                log_error!("core", "同步进程匹配开关到本地基线失败：{error:#}");
+            }
+        }
+
+        // 校验持久化的激活配置：内容缺失时回退到内置默认配置。
+        if let Some(active_id) = config.active_profile.clone()
+            && !profile::profile_yaml_path(&paths, &active_id).is_file()
+        {
+            config.active_profile = None;
+        }
+        let active_profile = config.active_profile.clone();
+        let runtime_error = profile::sync_runtime_file(
+            &paths,
+            baseline.as_ref(),
+            &config.mihomo_version,
+            active_profile.as_deref(),
+        )
+        .err()
+        .map(|error| {
+            log_error!("core", "同步运行时配置失败：{error:#}");
+            concise_error(&format!("{error:#}"), 200)
+        });
+        let runtime_ready = runtime_error.is_none();
+
+        // 上次异常退出可能遗留系统代理托管，启动时按记录恢复用户原有设置。
+        if let Some(snapshot) = load_system_proxy_state(&paths) {
+            match restore_system_proxy(&snapshot) {
+                Ok(()) => {
+                    clear_system_proxy_state(&paths);
+                    log_info!(
+                        "proxy",
+                        "检测到上次托管的系统代理，启动时已恢复用户原有设置"
+                    );
+                }
+                Err(error) => log_error!("proxy", "启动自愈恢复系统代理设置失败：{error:#}"),
+            }
+        }
+
+        let profile_form_name = cx.new(|cx| TextInput::new(t!("profiles.name_placeholder"), cx));
+        let profile_form_url = cx.new(|cx| TextInput::new(t!("profiles.url_placeholder"), cx));
+        let profile_edit_url = cx.new(|cx| TextInput::new(t!("profiles.url_placeholder"), cx));
+        let profile_form_interval =
+            cx.new(|cx| TextInput::new(t!("profiles.interval_placeholder"), cx));
+        let profiles = config.profiles.clone();
+        let (autostart_enabled, autostart_available) = match autostart_status() {
+            Ok(AutoStartStatus::Enabled) => (true, true),
+            Ok(AutoStartStatus::Disabled) => (false, true),
+            Ok(AutoStartStatus::Unavailable) => (false, false),
+            Err(error) => {
+                // 读取失败不代表平台不支持，保留可操作开关让用户可以直接重试写入。
+                log_warn!("autostart", "读取登录自启状态失败：{error:#}");
+                (false, true)
+            }
+        };
+        let tun_configured = baseline
+            .as_ref()
+            .is_some_and(|baseline| baseline.tun_enable);
+
+        let mut app = Self {
+            page: Page::Overview,
+            config,
+            paths,
+            kernel_available,
+            mihomo_process: None,
+            core_state: CoreState::Stopped,
+            core_start_generation: 0,
+            core_restart_pending: false,
+            mihomo_error: None,
+            system_proxy: false,
+            // 配置期望与真实运行状态分离；只有 controller 确认后才显示 TUN 开启。
+            tun_configured,
+            tun_state: SwitchState::Off,
+            autostart_enabled,
+            autostart_available,
+            // Windows 登录恢复 TUN 必须允许 UAC；Linux 已安装服务可在 false 时静默
+            // 启动，服务不可用则回退普通内核，不在登录阶段弹 polkit。
+            interactive_elevation_allowed: startup_allows_interactive_elevation(startup_mode),
+            mode: ProxyMode::Rule,
+            groups: Vec::new(),
+            runtime_state_failing: false,
+            connections_failing: false,
+            connections: Vec::new(),
+            traffic_down_speed: 0,
+            traffic_up_speed: 0,
+            download_total: 0,
+            upload_total: 0,
+            delay_testing: std::collections::HashSet::new(),
+            node_delays: std::collections::HashMap::new(),
+            node_delay_failures: std::collections::HashSet::new(),
+            profiles,
+            active_profile,
+            baseline,
+            profile_form_open: false,
+            profile_form_name,
+            profile_form_url,
+            profile_edit_url,
+            profile_busy: None,
+            profile_error: runtime_error,
+            auto_update_in_flight: None,
+            editing_profile_index: None,
+            profile_form_interval,
+            integration_error: None,
+            geodata_info,
+            geodata_updating: false,
+            geodata_status: None,
+            proxies_loading: false,
+            group_expanded: std::collections::HashMap::new(),
+            group_page: std::collections::HashMap::new(),
+            node_endpoints: std::collections::HashMap::new(),
+            server_visible: false,
+            update_checking: false,
+            update_available: false,
+            update_status: None,
+        };
+        // 开机即按上次记录的激活配置启动内核；失败时只在界面提示，不阻断打开。
+        // 新 runtime 未经校验或未能原子提交时不得沿用磁盘上的旧文件启动。
+        if runtime_ready {
+            app.start_core(cx);
+        }
+        app.spawn_connection_poll(cx);
+        app.spawn_profile_update_scheduler(cx);
+        app
+    }
+
+    /// 内核是否处于运行状态（controller 已就绪）。
+    fn mihomo_running(&self) -> bool {
+        matches!(self.core_state, CoreState::Running)
+    }
+
+    /// TUN 只有在内核运行且 controller 已确认时才算真正开启；持久配置本身
+    /// 不能用于状态展示，避免启动中或启动失败时出现虚假开启。
+    fn tun_running(&self) -> bool {
+        self.tun_switch_state() == SwitchState::On
+    }
+
+    /// 所有页面和托盘共用同一个可见状态，避免启动过程中显示为关闭。
+    fn tun_switch_state(&self) -> SwitchState {
+        tun_visible_state(self.core_state, self.tun_state)
+    }
+
+    /// 内核是否允许接受启停操作。
+    fn core_operable(&self) -> bool {
+        self.core_state != CoreState::Starting
+    }
+
+    /// 内核已经运行或正在异步启动；替换 runtime/Geo 数据时两种状态都必须重启。
+    fn core_active(&self) -> bool {
+        self.core_state != CoreState::Stopped
+    }
+
+    /// 生成当前语言下的托盘状态文案；托盘所有权由应用级 AppShell 持有。
+    pub(super) fn tray_texts(&self) -> TrayTexts {
+        let core = match self.core_state {
+            CoreState::Running => t!("tray.running"),
+            CoreState::Starting => t!("app.core_starting"),
+            CoreState::Stopped => t!("tray.stopped"),
+        };
+        let system_proxy = if self.system_proxy {
+            t!("tray.on")
+        } else {
+            t!("tray.off")
+        };
+        let tun = match self.tun_switch_state() {
+            SwitchState::On => t!("tray.on"),
+            SwitchState::Starting => t!("status.starting"),
+            SwitchState::Off => t!("tray.off"),
+        };
+        TrayTexts {
+            tooltip: t!(
+                "tray.tooltip",
+                core = core,
+                system_proxy = system_proxy,
+                tun = tun
+            )
+            .into_owned(),
+            open: t!("tray.menu_open").into_owned(),
+            quit: t!("tray.menu_quit").into_owned(),
+        }
+    }
+
+    fn palette(&self) -> Palette {
+        if self.config.theme.is_dark() {
+            Palette::dark()
+        } else {
+            Palette::light()
+        }
+    }
+
+    fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page == Page::Settings {
+            self.refresh_autostart_status();
+        }
+        self.page = page;
+        // 进入关于页时自动检查一次更新；本会话已有结果或正在检查则跳过，
+        // 手动按钮随时可以重新检查。
+        if page == Page::About && self.update_status.is_none() && !self.update_checking {
+            self.check_for_updates(cx);
+        }
+        cx.notify();
+    }
+
+    /// 关于页检查更新：查询仓库最新发布版本并与当前版本比较。
+    ///
+    /// 进入关于页自动触发一次，也可通过按钮手动重查；不做自动安装，
+    /// 发现新版本时仅在关于页提示并引导用户前往仓库。
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_available = false;
+        self.update_status = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::app::about::latest_release_version() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_checking = false;
+                this.update_status = Some(match result {
+                    Ok(Some(latest)) => {
+                        if crate::app::about::is_newer_version(&latest, Self::CURRENT_VERSION) {
+                            this.update_available = true;
+                            log_info!(
+                                "update",
+                                "发现新版本 {latest}（当前 v{}）",
+                                Self::CURRENT_VERSION
+                            );
+                            SharedString::from(
+                                t!("about.new_version", version = latest).into_owned(),
+                            )
+                        } else {
+                            tr("about.up_to_date")
+                        }
+                    }
+                    Ok(None) => tr("about.no_release"),
+                    Err(error) => {
+                        log_warn!("update", "检查应用更新失败：{error:#}");
+                        SharedString::from(
+                            t!(
+                                "about.check_failed",
+                                error = concise_error(&format!("{error:#}"), 160)
+                            )
+                            .into_owned(),
+                        )
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 设置页显式更新三份 Geo 数据；下载与哈希计算全部放到后台线程。
+    ///
+    /// 更新模块先固定官方 release 分支提交，再完整下载并原子提交同一快照。
+    /// 运行中的 Mihomo 会在成功切换后重启，确保新规则库立即生效。
+    fn update_geodata(&mut self, cx: &mut Context<Self>) {
+        if self.geodata_updating {
+            return;
+        }
+        self.geodata_updating = true;
+        self.geodata_status = None;
+        let paths = self.paths.clone();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::mihomo::geodata::update_from_official(&paths) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.geodata_updating = false;
+                match result {
+                    Ok(UpdateOutcome::UpToDate(info)) => {
+                        this.geodata_info = info;
+                        this.geodata_status = Some(tr("settings.geodata_up_to_date"));
+                    }
+                    Ok(UpdateOutcome::Updated(info)) => {
+                        let revision = short_revision(&info.revision);
+                        let restart_required = this.core_active();
+                        this.geodata_info = info;
+                        log_info!(
+                            "geodata",
+                            "Geo 数据已更新到 {revision}{}",
+                            if restart_required {
+                                "，重启内核生效"
+                            } else {
+                                ""
+                            }
+                        );
+                        this.geodata_status = Some(SharedString::from(if restart_required {
+                            t!("settings.geodata_updated_reloaded", revision = revision)
+                                .into_owned()
+                        } else {
+                            t!("settings.geodata_updated", revision = revision).into_owned()
+                        }));
+                        if restart_required {
+                            this.restart_core(cx);
+                        }
+                    }
+                    Err(error) => {
+                        log_error!("geodata", "更新 Geo 数据失败：{error:#}");
+                        this.geodata_status = Some(SharedString::from(
+                            t!(
+                                "settings.geodata_update_failed",
+                                error = concise_error(&format!("{error:#}"), 180)
+                            )
+                            .into_owned(),
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 标题栏和设置页共用同一主题状态，确保两个入口始终同步。
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        let previous = self.config.theme;
+        self.config.theme = previous.toggled();
+
+        if let Err(error) = self.config.save(&self.paths.config_file) {
+            // 写入失败时恢复旧值，避免界面状态与磁盘配置不一致。
+            self.config.theme = previous;
+            log_warn!("app", "保存主题配置失败：{error:#}");
+            return;
+        }
+
+        cx.notify();
+    }
+
+    /// 语言切换立即更新全局 locale 和主配置，保存失败时完整回滚。
+    fn toggle_language(&mut self, cx: &mut Context<Self>) {
+        self.set_language(self.config.language.toggled(), cx);
+    }
+
+    /// 登录自启开关直接修改平台配置；只有系统调用成功后才更新界面状态。
+    fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
+        if !self.autostart_available {
+            return;
+        }
+        let enabled = !self.autostart_enabled;
+        match set_autostart(enabled) {
+            Ok(()) => {
+                self.autostart_enabled = enabled;
+                log_info!(
+                    "autostart",
+                    "登录自启已{}",
+                    if enabled { "开启" } else { "关闭" }
+                );
+                self.integration_error = None;
+            }
+            Err(error) => {
+                log_error!("autostart", "设置登录自启失败：{error:#}");
+                self.integration_error = Some(
+                    t!(
+                        "app.autostart_failed",
+                        error = concise_error(&format!("{error:#}"), 160)
+                    )
+                    .into_owned(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// 每次进入设置页重新读取平台注册，外部启动管理器的修改不会被缓存状态覆盖。
+    fn refresh_autostart_status(&mut self) {
+        match autostart_status() {
+            Ok(AutoStartStatus::Enabled) => {
+                self.autostart_enabled = true;
+                self.autostart_available = true;
+            }
+            Ok(AutoStartStatus::Disabled) => {
+                self.autostart_enabled = false;
+                self.autostart_available = true;
+            }
+            Ok(AutoStartStatus::Unavailable) => {
+                self.autostart_enabled = false;
+                self.autostart_available = false;
+            }
+            Err(error) => {
+                // 短暂读取失败时保留上次状态，避免把已启用误画成关闭。
+                log_warn!("autostart", "刷新登录自启状态失败：{error:#}");
+            }
+        }
+    }
+
+    /// 用户明确打开窗口后，Linux 后续启用 TUN 可以弹出 polkit；登录自启本身
+    /// 已经启动普通内核或通过现有服务启动 TUN，不在这里补发内核启动。
+    fn allow_interactive_elevation(&mut self) {
+        self.interactive_elevation_allowed = true;
+    }
+
+    fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if language == self.config.language {
+            return;
+        }
+
+        let previous = self.config.language;
+        self.config.language = language;
+        rust_i18n::set_locale(language.code());
+
+        if let Err(error) = self.config.save(&self.paths.config_file) {
+            self.config.language = previous;
+            rust_i18n::set_locale(previous.code());
+            log_warn!("app", "保存语言配置失败：{error:#}");
+            return;
+        }
+
+        // 更新结果文案绑定生成时的 locale，切换语言后清空以避免混合显示。
+        self.geodata_status = None;
+        // 输入框占位文案在实体创建时固定，语言切换后按新 locale 重建。
+        self.profile_form_name = cx.new(|cx| TextInput::new(t!("profiles.name_placeholder"), cx));
+        self.profile_form_url = cx.new(|cx| TextInput::new(t!("profiles.url_placeholder"), cx));
+        cx.notify();
+    }
+
+    fn toggle_core(&mut self, cx: &mut Context<Self>) {
+        if self.mihomo_running() {
+            log_info!("core", "用户请求停止内核");
+            // 系统代理指向本机内核端口，停内核前先恢复用户原有代理设置。
+            self.disable_system_proxy();
+            self.stop_core();
+            // TUN 由内核承载，内核停止即失效；同步回退避免界面与下次启动
+            // 仍显示/启用已停止的 TUN。
+            if let Err(error) = self.revert_tun(cx) {
+                log_error!("tun", "停止内核时回退 TUN 配置失败：{error:#}");
+                self.integration_error = Some(concise_error(&format!("{error:#}"), 180));
+            }
+        } else {
+            self.start_core(cx);
+        }
+        cx.notify();
+    }
+
+    /// 启动内核：Windows 在独立线程完成配置校验与 UAC，避免重入 GPUI 更新回调。
+    ///
+    /// `ShellExecuteExW(runas)` 会运行嵌套消息循环；若在 GPUI 实体更新回调里同步
+    /// 调用，连接轮询等前台任务可能重入 `App` 并触发 `RefCell already borrowed`。
+    /// Linux 的 pdeathsig 与创建进程的线程生命周期绑定，仍保持当前线程启动。
+    fn start_core(&mut self, cx: &mut Context<Self>) {
+        if !self.core_operable() || self.mihomo_process.is_some() {
+            return;
+        }
+        self.core_start_generation = self.core_start_generation.wrapping_add(1);
+        let generation = self.core_start_generation;
+        self.core_state = CoreState::Starting;
+        self.tun_state = if self.tun_configured {
+            SwitchState::Starting
+        } else {
+            SwitchState::Off
+        };
+        self.mihomo_error = None;
+        cx.notify();
+
+        let paths = self.paths.clone();
+        let version = self.config.mihomo_version.clone();
+        let config_file = self.paths.runtime_mihomo_config_file.clone();
+        // TUN 需要系统网络权限；UAC/polkit 弹窗即用户的显式授权。
+        let elevated = self.tun_configured;
+        let allow_interactive_elevation = self.interactive_elevation_allowed;
+        log_info!(
+            "core",
+            "发起内核启动（版本 {}{}，runtime {}）",
+            version,
+            if elevated { "，提权/TUN" } else { "" },
+            config_file.display()
+        );
+
+        #[cfg(target_os = "windows")]
+        {
+            let (sender, receiver) = async_channel::bounded(1);
+            let thread = std::thread::Builder::new()
+                .name("pure-clash-kernel-start".to_owned())
+                .spawn(move || {
+                    let result = MihomoProcess::start(
+                        &paths,
+                        &version,
+                        &config_file,
+                        elevated,
+                        allow_interactive_elevation,
+                    );
+                    // 应用已退出时接收端会关闭；result 的 Drop 会回收已启动的内核。
+                    let _ = sender.send_blocking(result);
+                });
+            if let Err(error) = thread {
+                self.finish_core_start(
+                    generation,
+                    Err(anyhow::anyhow!("无法创建内核启动线程：{error}")),
+                    cx,
+                );
+                return;
+            }
+            cx.spawn(async move |this, cx| {
+                let result = receiver
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("内核启动线程未返回结果")));
+                let _ = this.update(cx, |this, cx| {
+                    this.finish_core_start(generation, result, cx);
+                });
+            })
+            .detach();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let result = MihomoProcess::start(
+                &paths,
+                &version,
+                &config_file,
+                elevated,
+                allow_interactive_elevation,
+            );
+            self.finish_core_start(generation, result, cx);
+        }
+    }
+
+    /// 提交一次内核启动结果；过期结果会随 `MihomoProcess::Drop` 立即终止。
+    fn finish_core_start(
+        &mut self,
+        generation: u64,
+        result: anyhow::Result<MihomoProcess>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.core_start_generation || self.core_state != CoreState::Starting {
+            drop(result);
+            if self.core_restart_pending && self.core_state == CoreState::Starting {
+                // 等旧启动线程完整返回并回收进程后，再按最新 runtime 发起唯一一次启动。
+                self.core_restart_pending = false;
+                self.core_state = CoreState::Stopped;
+                self.start_core(cx);
+            }
+            return;
+        }
+        match result {
+            Ok(process) => {
+                let pid = process.pid();
+                log_info!(
+                    "core",
+                    "内核进程已创建（pid {}）",
+                    pid.map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "未知".into())
+                );
+                self.mihomo_process = Some(process);
+                self.mihomo_error = None;
+                self.spawn_readiness_probe(generation, cx);
+            }
+            Err(error) => {
+                self.mihomo_process = None;
+                self.core_state = CoreState::Stopped;
+                self.tun_state = SwitchState::Off;
+                // 提权启动被拒绝（用户取消 UAC/polkit）或校验失败时，回退关闭 TUN
+                // 并以普通权限重新拉起内核，保证用户始终有可用代理。
+                if self.tun_configured {
+                    log_warn!(
+                        "tun",
+                        "TUN 内核启动失败，回退关闭 TUN 并重启普通内核：{error:#}"
+                    );
+                    let fallback_message = tun_reverted_error(&error);
+                    if let Err(revert_error) = self.revert_tun(cx) {
+                        log_error!("tun", "回退 TUN 配置失败：{revert_error:#}");
+                        self.integration_error = Some(concise_error(
+                            &format!("{fallback_message}；回退配置失败：{revert_error:#}"),
+                            220,
+                        ));
+                    } else {
+                        self.integration_error = Some(fallback_message);
+                        self.start_core(cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                let detail = concise_error(&format!("{error:#}"), 240);
+                // 失败详情写入日志前由日志层统一脱敏（URL 只留 host、token 掩码），
+                // 界面仍展示完整原因。
+                log_error!("core", "启动 Mihomo 失败：{error:#}");
+                self.mihomo_error = Some(t!("app.core_start_failed", error = detail).into_owned());
+            }
+        }
+        cx.notify();
+    }
+
+    /// 内核就绪后核对 TUN 是否真实生效。
+    ///
+    /// 内核在缺少系统网络权限或平台 TUN 能力时会静默降级继续运行，界面不能
+    /// 假装 TUN 已开启：未生效时自动回退关闭并重启内核，明确提示原因。
+    fn verify_tun_effective(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if !self.tun_configured {
+            return;
+        }
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let background = cx.background_executor().clone();
+            let result = async {
+                // Windows 首次创建 Wintun 网卡可能超过 3 秒；初始化中返回的
+                // tun.enable=false 不能立即判为失败。用单调时钟给足 30 秒，
+                // 避免按次数重试时把每次 HTTP 超时叠加成数分钟；其他平台保持 3 秒。
+                // 不记录完整响应，避免配置中的敏感字段进入日志。
+                let started = std::time::Instant::now();
+                let timeout = std::time::Duration::from_secs(if cfg!(target_os = "windows") {
+                    30
+                } else {
+                    3
+                });
+                let mut attempt = 0;
+                let mut last_log = std::time::Duration::ZERO;
+                let mut last_error = None;
+                log_info!("tun", "开始确认 TUN 状态（启动代次 {generation}，等待窗口 {} 秒，间隔 300ms）", timeout.as_secs());
+                while started.elapsed() < timeout {
+                    // 每轮检查代次：停止或切换配置后及时结束旧探针，避免等待期内
+                    // 多个探针对新内核重复请求或写入误导日志。
+                    let active = this.update(cx, |this, _| {
+                        generation == this.core_start_generation && this.tun_state == SwitchState::Starting
+                    }).unwrap_or(false);
+                    if !active { return Ok(()); }
+                    attempt += 1;
+                    let controller = controller.clone();
+                    let snapshot = background.spawn(async move { controller.configs() }).await;
+                    let active = this.update(cx, |this, _| {
+                        generation == this.core_start_generation && this.tun_state == SwitchState::Starting
+                    }).unwrap_or(false);
+                    if !active { return Ok(()); }
+                    let elapsed = started.elapsed();
+                    let log_progress = attempt == 1 || elapsed.saturating_sub(last_log) >= std::time::Duration::from_secs(5);
+                    match snapshot {
+                        Ok(config) => {
+                            // 持续等待每 5 秒留一条进度，成功/错误恢复立即记录。
+                            let recovered = last_error.take().is_some();
+                            if config.tun_enabled || log_progress || recovered {
+                                log_info!("tun", "TUN 状态检查 #{attempt}（代次 {generation}，累计 {}ms）：tun.enable={}", elapsed.as_millis(), config.tun_enabled);
+                                last_log = elapsed;
+                            }
+                            if config.tun_enabled {
+                                return Ok(());
+                            }
+                        }
+                        Err(error) => {
+                            let error = format!("{error:#}");
+                            if log_progress || last_error.as_ref() != Some(&error) {
+                                log_warn!("tun", "TUN 状态检查 #{attempt}（代次 {generation}，累计 {}ms）请求失败：{error}", elapsed.as_millis());
+                                last_log = elapsed;
+                            }
+                            last_error = Some(error);
+                        }
+                    }
+                    // 不在窗口尾部多等一次完整间隔；正在进行的 HTTP 请求仍受
+                    // controller 的 3 秒超时约束，最坏总时长约为窗口加一次请求。
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if !remaining.is_zero() {
+                        background.timer(remaining.min(std::time::Duration::from_millis(300))).await;
+                    }
+                }
+                log_warn!("tun", "TUN 确认窗口结束（代次 {generation}，累计 {}ms），Windows 初始化错误请检查 log/tun-kernel.log", started.elapsed().as_millis());
+                anyhow::bail!("Mihomo controller 未确认 TUN 已生效")
+            }.await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.core_start_generation || this.tun_state != SwitchState::Starting {
+                    return;
+                }
+                let Err(error) = result else {
+                    // 只有 controller 明确返回开启，界面和托盘才显示 TUN 已生效。
+                    log_info!("tun", "controller 确认 TUN 已生效");
+                    this.tun_state = SwitchState::On;
+                    cx.notify();
+                    return;
+                };
+                if !this.tun_configured {
+                    return;
+                }
+                // 即使回退文件写入失败，也结束过渡态，允许用户重试。
+                this.tun_state = SwitchState::Off;
+                // 回退事务会校验并原子写入关闭 TUN 的配置，运行中自动重启内核。
+                log_warn!("tun", "controller 未确认 TUN 生效，自动回退关闭：{error:#}");
+                let message = tun_reverted_error(&error);
+                // 挂在 integration_error 上：内核重启成功的就绪探针会清掉 mihomo_error。
+                this.integration_error = Some(match this.revert_tun(cx) {
+                    Ok(()) => message,
+                    Err(revert_error) => {
+                        log_error!("tun", "回退 TUN 配置失败：{revert_error:#}");
+                        concise_error(&format!("{message}；回退配置失败：{revert_error:#}"), 220)
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 后台轮询 controller `/version`；就绪后拉取运行模式与代理组。
+    fn spawn_readiness_probe(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let Some(controller) = self.controller() else {
+            self.core_state = CoreState::Running;
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let background = cx.background_executor().clone();
+            let probe = {
+                let timer = background.clone();
+                background.spawn(async move {
+                    for _ in 0..50 {
+                        if controller.version().is_ok() {
+                            return Ok(());
+                        }
+                        timer.timer(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(anyhow::anyhow!("等待 Mihomo controller 超时"))
+                })
+            };
+            let result = probe.await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.core_start_generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        log_info!("core", "controller 就绪，内核进入运行状态");
+                        this.core_state = CoreState::Running;
+                        this.mihomo_error = None;
+                        this.fetch_runtime_state(cx);
+                        this.verify_tun_effective(generation, cx);
+                    }
+                    Err(error) => {
+                        // 内核未能就绪：先恢复代理设置再回收进程，避免流量断在死端口上。
+                        log_error!("core", "等待 Mihomo controller 就绪超时：{error:#}");
+                        this.disable_system_proxy();
+                        this.stop_core();
+                        // TUN 开启时最常见的失败原因是缺少系统授权或平台 TUN 能力，
+                        // 自动回退到无 TUN 的配置并重新拉起内核，保证用户有可用代理。
+                        let mut fallback_error = None;
+                        if this.tun_configured {
+                            // 回退事务会校验并原子写入关闭 TUN 的配置，再拉起普通内核。
+                            match this.revert_tun(cx) {
+                                Ok(()) => this.start_core(cx),
+                                Err(revert_error) => {
+                                    log_error!("tun", "TUN 回退配置失败：{revert_error:#}");
+                                    fallback_error = Some(concise_error(
+                                        &format!("TUN 回退配置失败：{revert_error:#}"),
+                                        180,
+                                    ));
+                                }
+                            }
+                        }
+                        let start_error = t!(
+                            "app.core_start_failed",
+                            error = concise_error(&format!("{error:#}"), 160)
+                        )
+                        .into_owned();
+                        this.integration_error = Some(match fallback_error {
+                            Some(fallback_error) => {
+                                concise_error(&format!("{start_error}；{fallback_error}"), 240)
+                            }
+                            None => start_error,
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// controller 客户端；基线缺失时在线功能不可用。
+    fn controller(&self) -> Option<Controller> {
+        self.baseline.as_ref().map(Controller::new)
+    }
+
+    /// 后台拉取运行模式与代理组；内核未运行时忽略。
+    fn fetch_runtime_state(&mut self, cx: &mut Context<Self>) {
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        let runtime_config = self.paths.runtime_mihomo_config_file.clone();
+        self.proxies_loading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx.background_executor().spawn(async move {
+                let config = controller.configs()?;
+                let mut proxies = controller.proxies(config.mode)?;
+                // controller 返回无序映射，分组按订阅定义顺序展示。
+                order_groups(
+                    &mut proxies.groups,
+                    &read_proxy_group_order(&runtime_config),
+                );
+                // 节点接入信息（协议/服务器/端口）来自 runtime.yaml，供概览页展示。
+                let endpoints = read_node_endpoints(&runtime_config);
+                Ok::<_, anyhow::Error>((config, proxies, endpoints))
+            });
+            let result = snapshot.await;
+            let _ = this.update(cx, |this, cx| {
+                this.proxies_loading = false;
+                match result {
+                    Ok((config, proxies, endpoints)) => {
+                        this.mode = ProxyMode::from_controller(config.mode);
+                        this.groups = proxies.groups;
+                        this.node_endpoints = endpoints;
+                        if this.runtime_state_failing {
+                            this.runtime_state_failing = false;
+                            log_info!("controller", "controller 运行配置请求恢复正常");
+                        }
+                    }
+                    Err(error) => {
+                        // 每秒轮询失败只做边沿记录：从成功转入失败记一条 warn，
+                        // 恢复时记一条 info，避免刷屏。
+                        if !this.runtime_state_failing {
+                            this.runtime_state_failing = true;
+                            log_warn!("controller", "拉取 controller 状态失败：{error:#}");
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 实时连接与流量轮询：内核运行期间每秒拉取一次 /connections 快照。
+    ///
+    /// 任务随应用常驻，内核停止时只跳过拉取，无需在启停路径上管理生命周期；
+    /// 应用实体释放后循环自动退出。网速由相邻快照的累计字节数差分得出。
+    fn spawn_connection_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(CONNECTIONS_POLL_INTERVAL)
+                    .await;
+                let controller = this
+                    .update(cx, |this, _| {
+                        this.mihomo_running().then(|| this.controller()).flatten()
+                    })
+                    .ok()
+                    .flatten();
+                let Some(controller) = controller else {
+                    continue;
+                };
+                let snapshot = cx
+                    .background_executor()
+                    .spawn(async move { controller.connections() })
+                    .await;
+                let applied = this.update(cx, |this, cx| {
+                    // 快照返回时内核可能刚被停止；保持清空状态即可。
+                    if this.mihomo_running() {
+                        match snapshot {
+                            Ok(data) => {
+                                if this.connections_failing {
+                                    this.connections_failing = false;
+                                    log_info!("controller", "controller 连接轮询恢复正常");
+                                }
+                                this.apply_connections(data);
+                            }
+                            Err(error) => {
+                                // controller 短暂不可达时只清零流量；若受管进程也已
+                                // 退出，则立即撤销所有依赖内核的真实运行状态。
+                                let process_running = this
+                                    .mihomo_process
+                                    .as_mut()
+                                    .is_some_and(MihomoProcess::is_running);
+                                if process_running {
+                                    if !this.connections_failing {
+                                        this.connections_failing = true;
+                                        log_warn!(
+                                            "controller",
+                                            "连接轮询失败（内核进程仍在运行）：{error:#}"
+                                        );
+                                    }
+                                    this.clear_live_traffic();
+                                } else {
+                                    log_error!(
+                                        "core",
+                                        "受管内核进程意外退出，自动恢复系统代理并停止内核"
+                                    );
+                                    this.disable_system_proxy();
+                                    this.stop_core();
+                                    this.integration_error =
+                                        Some(t!("app.core_stopped_unexpectedly").into_owned());
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 应用连接快照并差分出实时网速；内核重启后累计值变小，差分自然归零。
+    fn apply_connections(&mut self, snapshot: ConnectionsSnapshot) {
+        self.traffic_down_speed = snapshot.download_total.saturating_sub(self.download_total);
+        self.traffic_up_speed = snapshot.upload_total.saturating_sub(self.upload_total);
+        self.download_total = snapshot.download_total;
+        self.upload_total = snapshot.upload_total;
+        self.connections = snapshot.connections;
+    }
+
+    /// controller 不可达时清空实时数据；下次成功快照会重新建立基准。
+    fn clear_live_traffic(&mut self) {
+        self.traffic_down_speed = 0;
+        self.traffic_up_speed = 0;
+        self.connections.clear();
+    }
+
+    /// 关闭单条连接：先乐观移除，失败时提示；下一拍轮询会带回真实状态。
+    fn close_connection(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        self.connections.retain(|connection| connection.id != id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { controller.close_connection(&id) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    log_warn!("controller", "关闭单个连接失败：{error:#}");
+                    this.integration_error = Some(concise_error(&format!("{error:#}"), 160));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 关闭全部连接。
+    fn close_all_connections(&mut self, cx: &mut Context<Self>) {
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        self.connections.clear();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { controller.close_all_connections() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    log_warn!("controller", "关闭全部连接失败：{error:#}");
+                    this.integration_error = Some(concise_error(&format!("{error:#}"), 160));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 节点当前展示的延迟：手动测速结果优先，其次取 /proxies 自带的历史值。
+    /// 返回 `Some(None)` 表示最近一次手动测速失败（超时/拒绝）。
+    fn node_delay(&self, node: &NodeSnapshot) -> Option<Option<u64>> {
+        if self.delay_testing.contains(&node.name) {
+            return None;
+        }
+        if self.node_delay_failures.contains(&node.name) {
+            return Some(None);
+        }
+        Some(Some(
+            self.node_delays.get(&node.name).copied().or(node.delay)?,
+        ))
+    }
+
+    /// 对策略组内全部节点测速：结果覆盖历史缓存，未返回的节点按失败处理。
+    fn test_group_delay(&mut self, name: String, cx: &mut Context<Self>) {
+        let group_key = format!("group:{name}");
+        if !self.mihomo_running() || self.delay_testing.contains(&group_key) {
+            return;
+        }
+        let Some(group) = self.groups.iter().find(|group| group.name == name) else {
+            return;
+        };
+        let nodes: Vec<String> = group.nodes.iter().map(|node| node.name.clone()).collect();
+        if nodes.is_empty() {
+            return;
+        }
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        self.delay_testing.insert(group_key.clone());
+        for node in &nodes {
+            self.delay_testing.insert(node.clone());
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { controller.group_delay(&name) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.delay_testing.remove(&group_key);
+                for node in &nodes {
+                    this.delay_testing.remove(node);
+                }
+                match result {
+                    Ok(delays) => {
+                        for node in &nodes {
+                            match delays.get(node) {
+                                Some(delay) => {
+                                    this.node_delays.insert(node.clone(), *delay);
+                                    this.node_delay_failures.remove(node);
+                                }
+                                // 本轮未返回即失败；失败状态让节点显示超时而非旧值。
+                                None => {
+                                    this.node_delays.remove(node);
+                                    this.node_delay_failures.insert(node.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log_debug!("proxy", "分组延迟测试失败：{error:#}");
+                        this.integration_error = Some(concise_error(&format!("{error:#}"), 160));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 对单个节点测速。
+    fn test_node_delay(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.mihomo_running() || self.delay_testing.contains(&name) {
+            return;
+        }
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        self.delay_testing.insert(name.clone());
+        let node_name = name.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { controller.proxy_delay(&name) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.delay_testing.remove(&node_name);
+                match result {
+                    Ok(delay) => {
+                        this.node_delays.insert(node_name.clone(), delay);
+                        this.node_delay_failures.remove(&node_name);
+                    }
+                    Err(_) => {
+                        this.node_delays.remove(&node_name);
+                        this.node_delay_failures.insert(node_name);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 分组当前是否展开：用户手动切换优先，未手动操作过的组走自动折叠规则。
+    fn group_expanded(&self, group: &GroupSnapshot) -> bool {
+        self.group_expanded
+            .get(&group.name)
+            .copied()
+            .unwrap_or_else(|| group_auto_expanded(&self.groups, &group.name))
+    }
+
+    /// 点击分组标题切换折叠；手动状态跨刷新保留，切换配置后按组名继续生效。
+    fn toggle_group_expanded(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(group) = self.groups.iter().find(|group| group.name == name) {
+            let expanded = !self.group_expanded(group);
+            self.group_expanded.insert(name, expanded);
+            cx.notify();
+        }
+    }
+
+    /// 分组当前渲染的节点数：默认首页，点过“显示更多”后按页累加。
+    fn group_rendered_count(&self, group: &GroupSnapshot) -> usize {
+        self.group_page
+            .get(&group.name)
+            .copied()
+            .map_or(PROXY_NODE_PAGE_SIZE, |count| count.min(group.nodes.len()))
+    }
+
+    /// “显示更多”翻页：在当前渲染数上加一页，封顶到节点总数。
+    fn show_more_nodes(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(group) = self.groups.iter().find(|group| group.name == name) {
+            let next =
+                (self.group_rendered_count(group) + PROXY_NODE_PAGE_SIZE).min(group.nodes.len());
+            self.group_page.insert(name, next);
+            cx.notify();
+        }
+    }
+
+    /// 重启内核并重新拉取状态；配置切换后的真实生效路径。
+    fn restart_core(&mut self, cx: &mut Context<Self>) {
+        if self.core_state == CoreState::Starting && self.mihomo_process.is_none() {
+            // UAC/校验线程无法安全强制取消；使其结果过期，并把多次重启合并为一次。
+            self.core_start_generation = self.core_start_generation.wrapping_add(1);
+            self.core_restart_pending = true;
+            cx.notify();
+            return;
+        }
+        log_info!("core", "重启内核以应用新配置");
+        self.stop_core();
+        self.start_core(cx);
+        cx.notify();
+    }
+
+    /// 回收 Mihomo 子进程；托盘退出和窗口内停止按钮共用同一条路径。
+    ///
+    /// 注意：配置切换（restart_core）也走这里，系统代理保持托管不中断，
+    /// 仅在真实停机路径（手动停止/退出/内核失联）由调用方恢复代理设置。
+    pub(crate) fn stop_core(&mut self) {
+        // 让仍在 UAC/校验线程中的启动结果失效；结果返回后由 Drop 自动回收。
+        self.core_start_generation = self.core_start_generation.wrapping_add(1);
+        self.core_restart_pending = false;
+        let stop_result = self.mihomo_process.take().map(|mut process| process.stop());
+
+        self.core_state = CoreState::Stopped;
+        self.tun_state = SwitchState::Off;
+        if let Some(Err(error)) = stop_result {
+            let detail = concise_error(&format!("{error:#}"), 240);
+            log_error!("core", "停止 Mihomo 失败：{error:#}");
+            self.mihomo_error = Some(t!("app.core_stop_failed", error = detail).into_owned());
+        } else {
+            log_info!("core", "内核已停止");
+            self.mihomo_error = None;
+        }
+
+        // 内核停止后在线数据不再有效；TUN 的回退由真实停机路径（toggle_core/
+        // 启动失败回退）显式调用 revert_tun，配置切换重启不在此处处理。
+        self.groups.clear();
+        self.connections.clear();
+        self.traffic_down_speed = 0;
+        self.traffic_up_speed = 0;
+        self.download_total = 0;
+        self.upload_total = 0;
+        self.delay_testing.clear();
+        self.node_delays.clear();
+        self.node_delay_failures.clear();
+        // 新内核从健康状态重新开始统计，不能继承上一进程的失败边沿。
+        self.runtime_state_failing = false;
+        self.connections_failing = false;
+    }
+
+    /// 退出前的完整清理：恢复系统代理并回收内核；托盘退出专用。
+    pub(crate) fn shutdown(&mut self) {
+        log_info!("app", "应用退出：恢复系统代理并停止内核");
+        self.disable_system_proxy();
+        self.stop_core();
+    }
+
+    /// 开关系统代理：启用要求内核运行中；关闭恢复托管前的用户设置。
+    fn toggle_system_proxy(&mut self, cx: &mut Context<Self>) {
+        if !self.system_proxy {
+            if !self.mihomo_running() {
+                self.integration_error = Some(t!("app.system_proxy_requires_core").into_owned());
+                cx.notify();
+                return;
+            }
+            let Some(baseline) = self.baseline.clone() else {
+                self.integration_error = Some(t!("app.baseline_missing").into_owned());
+                cx.notify();
+                return;
+            };
+            let addr = format!("127.0.0.1:{}", baseline.mixed_port);
+            log_info!("proxy", "开启系统代理（{addr}）");
+            match enable_system_proxy(&self.paths, &addr) {
+                Ok(()) => {
+                    self.integration_error = None;
+                    self.system_proxy = true;
+                }
+                Err(error) => {
+                    log_error!("proxy", "开启系统代理失败：{error:#}");
+                    self.integration_error = Some(system_proxy_error(&error));
+                }
+            }
+        } else {
+            self.disable_system_proxy();
+        }
+        cx.notify();
+    }
+
+    /// 关闭系统代理并恢复托管前的用户设置；停内核与退出应用共用。
+    fn disable_system_proxy(&mut self) {
+        if !self.system_proxy {
+            return;
+        }
+        let snapshot = load_system_proxy_state(&self.paths).unwrap_or_default();
+        match restore_system_proxy(&snapshot) {
+            Ok(()) => {
+                clear_system_proxy_state(&self.paths);
+                log_info!("proxy", "系统代理已关闭并恢复用户原有设置");
+                self.system_proxy = false;
+                self.integration_error = None;
+            }
+            Err(error) => {
+                // 恢复失败意味着用户系统设置可能残留 Pure Clash 代理地址，
+                // 必须完整留痕供排查。
+                log_error!("proxy", "恢复用户原有系统代理设置失败：{error:#}");
+                self.integration_error = Some(system_proxy_error(&error));
+            }
+        }
+    }
+
+    /// 回退 TUN：状态、基线与运行时配置同步关闭并持久化。
+    ///
+    /// 供真实停机路径调用（手动停止内核、启动失败、TUN 未生效回退）；
+    /// 调用时内核应已停止或尚未拉起，配置事务因此只重写 runtime.yaml，
+    /// 不会重启内核。配置切换重启与托盘退出不走这里，TUN 基线保持不变。
+    fn revert_tun(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        self.apply_tun_configuration(false, cx)
+    }
+
+    /// 开关 TUN：写入本地基线并重新合并校验；内核运行中自动重启生效。
+    ///
+    /// TUN 由内核承载，内核未运行时不允许开启（与系统代理约束一致）；
+    /// 授权和初始化期间不接受重复切换，仍可通过停止内核中止运行。
+    fn toggle_tun(&mut self, cx: &mut Context<Self>) {
+        if !self.core_operable() || self.tun_switch_state() == SwitchState::Starting {
+            return;
+        }
+        let enabled = !self.tun_configured;
+        if enabled && !self.mihomo_running() {
+            log_warn!("tun", "拒绝开启 TUN：内核未运行");
+            self.integration_error = Some(t!("app.tun_requires_core").into_owned());
+            cx.notify();
+            return;
+        }
+        let Some(_) = self.baseline.as_ref() else {
+            log_warn!("tun", "拒绝切换 TUN：本地基线不可用");
+            self.integration_error = Some(t!("app.baseline_missing").into_owned());
+            cx.notify();
+            return;
+        };
+        if let Err(error) = self.apply_tun_configuration(enabled, cx) {
+            log_error!("tun", "TUN 配置事务失败：{error:#}");
+            self.integration_error = Some(concise_error(&format!("{error:#}"), 160));
+            cx.notify();
+            return;
+        }
+        log_info!(
+            "tun",
+            "TUN 配置已{}（内核重启后由 controller 确认真实生效）",
+            if enabled { "开启" } else { "关闭" }
+        );
+        self.integration_error = None;
+        cx.notify();
+    }
+
+    /// 先校验目标 TUN 配置，再提交基线和 runtime；任一写入失败均不重启当前内核。
+    fn apply_tun_configuration(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let previous = self
+            .baseline
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("本地基线不可用"))?;
+        let mut desired = previous.clone();
+        desired.tun_enable = enabled;
+        let runtime = profile::prepare_runtime(
+            &self.paths,
+            Some(&desired),
+            &self.config.mihomo_version,
+            self.active_profile.as_deref(),
+        )?;
+
+        save_baseline(&self.paths, &desired)?;
+        if let Err(error) = write_runtime(&self.paths, &runtime) {
+            let rollback = save_baseline(&self.paths, &previous);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(anyhow::anyhow!(
+                    "{error:#}；恢复原本地基线也失败：{rollback_error:#}"
+                )),
+            };
+        }
+
+        self.baseline = Some(desired);
+        self.tun_configured = enabled;
+        // 配置提交不等于系统能力已经生效；重启后由 controller 再确认。
+        self.tun_state = SwitchState::Off;
+        if self.core_active() {
+            self.restart_core(cx);
+        }
+        Ok(())
+    }
+
+    /// 强制进程名开关：app.json 先行持久化，基线与 runtime 走同一 `-t` 事务；
+    /// 运行中的内核经 controller 热切换，不重启进程、不断开存量连接。
+    fn toggle_find_process(&mut self, cx: &mut Context<Self>) {
+        let Some(previous_baseline) = self.baseline.clone() else {
+            self.integration_error = Some(t!("app.baseline_missing").into_owned());
+            cx.notify();
+            return;
+        };
+        let enabled = !self.config.find_process_always;
+
+        // app.json 是开关的唯一事实来源；保存失败时不产生任何后续变更。
+        let previous_setting = self.config.find_process_always;
+        self.config.find_process_always = enabled;
+        if let Err(error) = self.config.save(&self.paths.config_file) {
+            self.config.find_process_always = previous_setting;
+            log_warn!("app", "保存强制进程名开关失败：{error:#}");
+            self.integration_error = Some(concise_error(&format!("{error:#}"), 160));
+            cx.notify();
+            return;
+        }
+
+        let mut desired = previous_baseline;
+        desired.find_process_always = enabled;
+        match self.apply_find_process_configuration(&desired, cx) {
+            Ok(()) => {
+                log_info!(
+                    "app",
+                    "强制进程名已{}",
+                    if enabled { "开启" } else { "关闭" }
+                );
+                self.integration_error = None;
+            }
+            Err(error) => {
+                // 配置事务失败时回滚 app.json，保持开关显示与实际生效一致。
+                self.config.find_process_always = previous_setting;
+                let _ = self.config.save(&self.paths.config_file);
+                log_error!("app", "应用强制进程名配置失败：{error:#}");
+                self.integration_error = Some(concise_error(&format!("{error:#}"), 180));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 提交进程匹配配置：先 `-t` 终审再原子落盘基线与 runtime，任一步失败
+    /// 都不改变磁盘状态；成功后运行中的内核经 controller 即时生效。
+    fn apply_find_process_configuration(
+        &mut self,
+        desired: &crate::mihomo::config::LocalBaseline,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let runtime = profile::prepare_runtime(
+            &self.paths,
+            Some(desired),
+            &self.config.mihomo_version,
+            self.active_profile.as_deref(),
+        )?;
+        // 切换前快照：运行中内核 PATCH 失败时按此整体回滚（内存开关、
+        // app.json、基线与 runtime），保证界面显示与实际运行状态一致。
+        // 调用方 toggle 以取反方式切换，旧开关值即 !desired 的值；
+        // 能走到热切换说明基线存在（controller 由基线构造）。
+        let rollback_setting = !desired.find_process_always;
+        let Some(rollback_baseline) = self.baseline.clone() else {
+            return Ok(());
+        };
+        let rollback_runtime = std::fs::read_to_string(&self.paths.runtime_mihomo_config_file).ok();
+        save_baseline(&self.paths, desired)?;
+        if let Err(error) = write_runtime(&self.paths, &runtime) {
+            // runtime 写入失败时回滚基线，保持磁盘一致。
+            if let Some(previous) = self.baseline.as_ref() {
+                let _ = save_baseline(&self.paths, previous);
+            }
+            return Err(error);
+        }
+        self.baseline = Some(desired.clone());
+        // 内核运行中热切换；正在启动的内核沿用旧模式，下次重启从磁盘生效。
+        if self.mihomo_running()
+            && let Some(controller) = self.controller()
+        {
+            let mode = if desired.find_process_always {
+                "always"
+            } else {
+                "strict"
+            };
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { controller.patch_find_process_mode(mode) })
+                    .await;
+                if let Err(error) = result {
+                    let _ = this.update(cx, |this, cx| {
+                        log_warn!(
+                            "app",
+                            "运行中内核切换进程匹配模式失败，回滚开关设置：{error:#}"
+                        );
+                        // 完整回滚四处状态，与磁盘写入事务的失败回滚对齐：
+                        // 内存开关、app.json、local.yaml、runtime.yaml。
+                        this.config.find_process_always = rollback_setting;
+                        if let Err(save_error) = this.config.save(&this.paths.config_file) {
+                            log_warn!("app", "回滚 app.json 失败：{save_error:#}");
+                        }
+                        if let Err(baseline_error) = save_baseline(&this.paths, &rollback_baseline)
+                        {
+                            log_warn!("app", "回滚本地基线失败：{baseline_error:#}");
+                        }
+                        if let Some(old_runtime) = rollback_runtime.as_deref()
+                            && let Err(runtime_error) = write_runtime(&this.paths, old_runtime)
+                        {
+                            log_warn!("app", "回滚运行时配置失败：{runtime_error:#}");
+                        }
+                        this.baseline = Some(rollback_baseline);
+                        this.integration_error = Some(
+                            t!(
+                                "app.find_process_rollback",
+                                error = concise_error(&format!("{error:#}"), 160)
+                            )
+                            .into_owned(),
+                        );
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        Ok(())
+    }
+
+    /// 切换运行模式：先经 controller 生效，成功后才更新本地状态。
+    fn set_mode(&mut self, mode: ProxyMode, cx: &mut Context<Self>) {
+        if !self.mihomo_running() || mode == self.mode {
+            return;
+        }
+        let Some(controller) = self.controller() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let target = mode.to_controller();
+            let result = cx
+                .background_executor()
+                .spawn(async move { controller.patch_mode(target.as_str()) })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.mode = mode;
+                    // GLOBAL 组的可见性随模式变化，重新拉取分组。
+                    this.fetch_runtime_state(cx);
+                }
+                Err(error) => {
+                    log_warn!("proxy", "切换运行模式失败：{error:#}");
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 在策略组中选择节点：乐观更新界面，后台提交 controller，失败回拉。
+    fn select_node(&mut self, group_index: usize, node_index: usize, cx: &mut Context<Self>) {
+        let Some(group) = self.groups.get(group_index) else {
+            return;
+        };
+        let Some(node) = group.nodes.get(node_index) else {
+            return;
+        };
+        if !group.selectable || group.now == node.name || !self.mihomo_running() {
+            return;
+        }
+        let group_name = group.name.clone();
+        let node_name = node.name.clone();
+        let Some(controller) = self.controller() else {
+            return;
+        };
+
+        if let Some(group) = self.groups.get_mut(group_index) {
+            group.now = node_name.clone();
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let log_group = group_name.clone();
+            let log_node = node_name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { controller.select_proxy(&group_name, &node_name) })
+                .await;
+            if let Err(error) = result {
+                log_warn!(
+                    "proxy",
+                    "选择节点失败（{log_group} → {log_node}）：{error:#}"
+                );
+                let _ = this.update(cx, |this, cx| this.fetch_runtime_state(cx));
+            }
+        })
+        .detach();
+    }
+
+    /// 保存 profiles 列表到主配置；失败时回滚。
+    fn save_profiles(&mut self) {
+        let previous = self.config.profiles.clone();
+        let previous_active = self.config.active_profile.clone();
+        self.config.profiles = self.profiles.clone();
+        self.config.active_profile = self.active_profile.clone();
+        if let Err(error) = self.config.save(&self.paths.config_file) {
+            self.config.profiles = previous;
+            self.config.active_profile = previous_active;
+            log_error!("profile", "保存配置列表失败：{error:#}");
+        }
+    }
+
+    /// 先原子保存候选元数据，再替换界面状态；编辑和排序落盘失败时保持原列表。
+    fn commit_profile_metadata(&mut self, profiles: Vec<ProfileMeta>) -> anyhow::Result<()> {
+        let mut config = self.config.clone();
+        config.profiles = profiles.clone();
+        config.active_profile = self.active_profile.clone();
+        config.save(&self.paths.config_file)?;
+        self.config = config;
+        self.profiles = profiles;
+        Ok(())
+    }
+
+    /// 拖动仅调整展示顺序，不修改激活 ID、profile 文件或正在运行的内核。
+    fn reorder_profiles(&mut self, source_id: &str, target_id: &str, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let mut profiles = self.profiles.clone();
+        if !profile::reorder_profiles(&mut profiles, source_id, target_id) {
+            return;
+        }
+        self.profile_error = None;
+        if let Err(error) = self.commit_profile_metadata(profiles) {
+            log_error!("profile", "保存配置排序失败：{error:#}");
+            self.profile_error = Some(t!("profiles.save_failed").into_owned());
+        }
+        cx.notify();
+    }
+
+    /// 配置页动作互斥锁：手动忙态、行内编辑或后台自动更新进行中时，
+    /// 暂停其他会修改配置列表 / profile 文件的操作，避免并发写与下标漂移。
+    fn profile_actions_locked(&self) -> bool {
+        self.profile_busy.is_some()
+            || self.editing_profile_index.is_some()
+            || self.auto_update_in_flight.is_some()
+    }
+
+    /// 打开或关闭添加配置的内联表单。
+    fn toggle_profile_form(&mut self, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        self.profile_form_open = !self.profile_form_open;
+        if !self.profile_form_open {
+            self.profile_error = None;
+        }
+        cx.notify();
+    }
+
+    /// 确认添加订阅：后台下载并校验，通过后保存并自动激活。
+    fn add_subscription(&mut self, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let url = self.profile_form_url.read(cx).content().trim().to_owned();
+        if let Err(error) = profile::validate_subscription_url(&url) {
+            self.profile_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        // 间隔先于下载校验：非法输入立即反馈，不浪费一次下载。
+        let interval_input = self
+            .profile_form_interval
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
+        let interval = match profile::parse_update_interval(&interval_input) {
+            Ok(minutes) => minutes,
+            Err(error) => {
+                self.profile_error =
+                    Some(t!("profiles.interval_invalid", error = error.to_string()).into_owned());
+                cx.notify();
+                return;
+            }
+        };
+        let name = {
+            let input = self.profile_form_name.read(cx).content().trim().to_owned();
+            if input.is_empty() {
+                profile::default_name_from_url(&url)
+                    .unwrap_or_else(|| t!("profiles.default_name").into_owned())
+            } else {
+                input
+            }
+        };
+
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        self.profile_busy = Some(t!("profiles.busy_downloading").into_owned());
+        self.profile_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let url_inner = url.clone();
+            let host = host_of_url(&url).to_owned();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let content = profile::download_subscription(&url_inner)?;
+                    let id = profile::new_profile_id();
+                    let runtime = profile::validate_and_store(&paths, &version, &id, &content)?;
+                    Ok::<_, anyhow::Error>((id, runtime))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match result {
+                Ok((id, runtime)) => {
+                    this.profile_busy = None;
+                    this.profile_form_open = false;
+                    log_info!("profile", "订阅已下载并保存（{name}，{host}）");
+                    let mut meta = profile::subscription_meta(name, url);
+                    // 文件已按后台任务生成的 id 落盘，元数据必须使用同一 id。
+                    meta.id = id;
+                    meta.update_interval_minutes = interval;
+                    if interval > 0 {
+                        log_info!("profile", "新订阅自动更新间隔：{interval} 分钟");
+                    }
+                    let index = this.profiles.len();
+                    this.profiles.push(meta);
+                    this.save_profiles();
+                    this.activate_profile_by_id(index, runtime, cx);
+                }
+                Err(error) => {
+                    this.profile_busy = None;
+                    log_error!("profile", "下载订阅失败（{host}）：{error:#}");
+                    this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 选择并导入本地 Mihomo YAML；只保存校验后的内容副本，不持久化源文件路径。
+    fn import_local_profile(&mut self, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let preferred_name = self.profile_form_name.read(cx).content().trim().to_owned();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr("profiles.file_picker_import")),
+        });
+        self.profile_busy = Some(t!("profiles.busy_selecting").into_owned());
+        self.profile_error = None;
+        cx.notify();
+
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let selected = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => {
+                    // 用户取消属于正常流程，仅恢复表单可操作状态。
+                    let _ = this.update(cx, |this, cx| {
+                        this.profile_busy = None;
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.profile_busy = None;
+                        this.profile_error = Some(
+                            t!(
+                                "profiles.import_failed",
+                                error = concise_error(&format!("{error:#}"), 180)
+                            )
+                            .into_owned(),
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.profile_busy = None;
+                        this.profile_error = Some(
+                            t!(
+                                "profiles.import_failed",
+                                error = concise_error(&error.to_string(), 180)
+                            )
+                            .into_owned(),
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let Some(path) = selected else {
+                let _ = this.update(cx, |this, cx| {
+                    this.profile_busy = None;
+                    cx.notify();
+                });
+                return;
+            };
+            let name = if preferred_name.is_empty() {
+                profile::default_name_from_path(&path)
+                    .unwrap_or_else(|| t!("profiles.default_local_name").into_owned())
+            } else {
+                preferred_name
+            };
+
+            let _ = this.update(cx, |this, cx| {
+                this.profile_busy = Some(t!("profiles.busy_importing").into_owned());
+                cx.notify();
+            });
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let content = profile::read_local_config(&path)?;
+                    let id = profile::new_profile_id();
+                    let runtime = profile::validate_and_store(&paths, &version, &id, &content)?;
+                    Ok::<_, anyhow::Error>((id, runtime))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match result {
+                Ok((id, runtime)) => {
+                    this.profile_busy = None;
+                    this.profile_form_open = false;
+                    log_info!("profile", "本地配置已导入并保存（{name}）");
+                    let mut meta = profile::local_meta(name);
+                    // 文件已按后台任务生成的 id 落盘，元数据必须使用同一 id。
+                    meta.id = id;
+                    let index = this.profiles.len();
+                    this.profiles.push(meta);
+                    this.save_profiles();
+                    this.activate_profile_by_id(index, runtime, cx);
+                }
+                Err(error) => {
+                    this.profile_busy = None;
+                    log_error!("profile", "导入本地配置失败：{error:#}");
+                    this.profile_error = Some(
+                        t!(
+                            "profiles.import_failed",
+                            error = concise_error(&format!("{error:#}"), 180)
+                        )
+                        .into_owned(),
+                    );
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 重新下载订阅内容并更新时间戳；激活中的配置同时刷新内核。
+    fn update_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let Some(meta) = self.profiles.get(index) else {
+            return;
+        };
+        let Some(url) = meta.url.clone() else {
+            return;
+        };
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        let id = meta.id.clone();
+        self.profile_busy = Some(t!("profiles.busy_updating").into_owned());
+        self.profile_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let id_inner = id.clone();
+            let host = host_of_url(&url).to_owned();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let content = profile::download_subscription(&url)?;
+                    let runtime =
+                        profile::validate_and_store(&paths, &version, &id_inner, &content)?;
+                    Ok::<_, anyhow::Error>(runtime)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(runtime) => {
+                    this.profile_busy = None;
+                    let name = this
+                        .profiles
+                        .get(index)
+                        .map(|meta| meta.name.clone())
+                        .unwrap_or_default();
+                    log_info!("profile", "订阅已更新（{name}，{host}）");
+                    if let Some(meta) = this.profiles.get_mut(index) {
+                        meta.updated_at = profile::now_secs();
+                    }
+                    this.save_profiles();
+                    if this.active_profile.as_deref() == Some(id.as_str())
+                        && let Err(error) = this.apply_runtime(&runtime, cx)
+                    {
+                        log_error!("profile", "应用更新后的运行时配置失败：{error:#}");
+                        this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.profile_busy = None;
+                    log_error!("profile", "更新订阅失败（{host}）：{error:#}");
+                    this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 订阅自动更新调度：常驻任务每分钟一跳，按墙钟到期比较挑一个到期订阅。
+    ///
+    /// 挂在 PureClash 实体上（与连接轮询同模式），主窗口关闭、后台自启模式
+    /// 下照常运行；睡眠/休眠唤醒后 due-time 立即成立，自动补跑错过的更新。
+    /// 首跳延迟 90 秒，避开内核启动、系统代理自愈与就绪探针的窗口。
+    fn spawn_profile_update_scheduler(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            // 启动缓冲：登录自启阶段不与内核拉起、代理自愈抢时间。
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(90))
+                .await;
+            loop {
+                cx.background_executor()
+                    .timer(PROFILE_UPDATE_TICK_INTERVAL)
+                    .await;
+                // 主线程实体回调里挑到期订阅；与手动操作、进行中的自动更新
+                // 互斥，内核 Starting 期间不做任何配置变更。
+                let index = this
+                    .update(cx, |this, _| {
+                        if this.profile_actions_locked() || this.core_state == CoreState::Starting {
+                            return None;
+                        }
+                        let now = profile::now_secs();
+                        this.profiles
+                            .iter()
+                            .position(|meta| profile::subscription_due(meta, now))
+                    })
+                    .ok()
+                    .flatten();
+                let Some(index) = index else {
+                    continue;
+                };
+                this.update(cx, |this, cx| this.auto_update_profile(index, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// 自动更新一个到期订阅：静默执行（不占用 profile_busy），下载校验与
+    /// 手动更新共用链路；失败只记日志与尝试时间，不打扰界面。
+    ///
+    /// 应用策略分三级：内容与磁盘一致时只刷时间戳跳过一切配置变更（也不必
+    /// 再跑内核 `-t` 终审）；有变更且命中激活订阅时优先 controller 热重载
+    /// （`PUT /configs?force=true`，进程存活、既有连接不断），热重载失败才
+    /// 回退整进程重启，与 Clash Verge Rev 的应用姿态一致。
+    ///
+    /// 互斥与成功标记的时序：`auto_update_in_flight` 保持到本次更新的应用
+    /// 真正结束（热重载完成或回退重启发起）才释放，期间配置页全部动作锁定，
+    /// 避免热重载晚到的结果覆盖用户刚做的变更。`updated_at` 只在内容确定
+    /// 持久化后刷新：写 runtime 失败会回滚 profile 文件并保留旧 updated_at，
+    /// 下次到期重新下载时内容比对不再命中，自然重走完整链路修复 runtime。
+    fn auto_update_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        // 选中到期项后再次检查，防止行内编辑与后台更新交错修改同一订阅。
+        if self.profile_actions_locked() {
+            return;
+        }
+        let Some(meta) = self.profiles.get(index) else {
+            return;
+        };
+        let Some(url) = meta.url.clone() else {
+            return;
+        };
+        let id = meta.id.clone();
+        self.auto_update_in_flight = Some(id.clone());
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        let host = host_of_url(&url).to_owned();
+        let name = meta.name.clone();
+        log_info!("profile", "订阅到期，自动更新开始（{name}，{host}）");
+
+        cx.spawn(async move |this, cx| {
+            let id_inner = id.clone();
+            // Ok(None) = 内容无变化；Ok(Some((合并产物, 旧 profile 内容))) =
+            // 已落盘新内容，旧内容供写 runtime 失败时回滚（None = 原本无文件）。
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let content = profile::download_subscription(&url)?;
+                    let profile_path = profile::profile_yaml_path(&paths, &id_inner);
+                    // 与磁盘上的现有内容直接比对（本地比较，语义等同哈希且
+                    // 无碰撞）：一致则磁盘内容已通过校验，跳过落盘与 -t 终审。
+                    let existing = std::fs::read_to_string(&profile_path).ok();
+                    if existing.as_deref() == Some(content.as_str()) {
+                        return Ok::<_, anyhow::Error>(None);
+                    }
+                    let runtime =
+                        profile::validate_and_store(&paths, &version, &id_inner, &content)?;
+                    Ok(Some((runtime, existing)))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                // 配置可能在下载期间被删除；按 id 而非下标定位。
+                let index = this.profiles.iter().position(|meta| meta.id == id);
+                let Some(index) = index else {
+                    this.auto_update_in_flight = None;
+                    return;
+                };
+                // 无论后续应用结果如何都记录尝试时间，顺延下一个完整间隔。
+                let now = profile::now_secs();
+                if let Some(meta) = this.profiles.get_mut(index) {
+                    meta.last_auto_attempt_at = now;
+                }
+                match result {
+                    Ok(None) => {
+                        // 内容无变化：只刷时间戳，不产生任何配置变更。
+                        if let Some(meta) = this.profiles.get_mut(index) {
+                            meta.updated_at = now;
+                        }
+                        this.save_profiles();
+                        this.auto_update_in_flight = None;
+                        log_info!(
+                            "profile",
+                            "订阅自动更新：内容无变化，跳过应用（{name}，{host}）"
+                        );
+                    }
+                    Ok(Some((runtime, existing))) => {
+                        // 非激活订阅只落盘 profile 文件，不动内核：落盘完成
+                        // 即本次更新结束。
+                        if this.active_profile.as_deref() != Some(id.as_str()) {
+                            if let Some(meta) = this.profiles.get_mut(index) {
+                                meta.updated_at = now;
+                            }
+                            this.save_profiles();
+                            this.auto_update_in_flight = None;
+                            log_info!(
+                                "profile",
+                                "订阅自动更新成功（{name}，{host}，非激活仅落盘）"
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        // 激活订阅：写 runtime 失败必须回滚 profile 文件并保留
+                        // 旧 updated_at——否则下次到期会因下载内容与磁盘相同
+                        // 走跳过路径，旧 runtime 永远得不到修复。
+                        if let Err(error) = write_runtime(&this.paths, &runtime) {
+                            let profile_path = profile::profile_yaml_path(&this.paths, &id);
+                            let rollback = match existing.as_deref() {
+                                Some(old_content) => crate::platform::file::atomic_write(
+                                    &profile_path,
+                                    old_content.as_bytes(),
+                                ),
+                                None => {
+                                    std::fs::remove_file(&profile_path).map_err(anyhow::Error::from)
+                                }
+                            };
+                            if let Err(rollback_error) = rollback {
+                                // 回滚失败只记日志：该场景需要磁盘写连续两次
+                                // 失败，概率极低，下次到期仍会重试。
+                                log_error!("profile", "回滚订阅文件失败：{rollback_error:#}");
+                            }
+                            this.save_profiles();
+                            this.auto_update_in_flight = None;
+                            log_error!(
+                                "profile",
+                                "写入运行时配置失败，已回滚订阅内容（{name}，{host}）：{error:#}"
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        // runtime 已持久化：从这一刻起内容终将生效（热重载/
+                        // 重启/下次启动），刷新 updated_at 是安全的。
+                        if let Some(meta) = this.profiles.get_mut(index) {
+                            meta.updated_at = now;
+                        }
+                        this.save_profiles();
+                        log_info!("profile", "订阅自动更新成功（{name}，{host}）");
+                        if !this.mihomo_running() {
+                            // 内核未运行（含启动中）：新 runtime 下次启动时生效。
+                            this.auto_update_in_flight = None;
+                            log_info!("profile", "内核未运行，新配置将在下次启动时生效");
+                            cx.notify();
+                            return;
+                        }
+                        match this.controller() {
+                            Some(controller) => {
+                                // 热重载优先：互斥保持到热重载结束（或回退
+                                // 重启发起）后才释放；此时 runtime 已落盘，
+                                // 重启路径由 Starting 状态与启动代次机制接管。
+                                let runtime_yaml = runtime;
+                                cx.spawn(async move |this, cx| {
+                                    let result = cx
+                                        .background_executor()
+                                        .spawn(
+                                            async move { controller.reload_config(&runtime_yaml) },
+                                        )
+                                        .await;
+                                    let _ = this.update(cx, |this, cx| {
+                                        this.auto_update_in_flight = None;
+                                        match result {
+                                            Ok(()) => {
+                                                log_info!(
+                                                    "profile",
+                                                    "新配置已热重载生效（内核未重启）"
+                                                );
+                                            }
+                                            Err(error) => {
+                                                log_warn!(
+                                                    "profile",
+                                                    "热重载失败，回退重启内核生效：{error:#}"
+                                                );
+                                                this.restart_core(cx);
+                                            }
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                                .detach();
+                            }
+                            None => {
+                                // 基线不可用导致没有 controller 时退回重启路径。
+                                log_warn!("profile", "controller 不可用，回退重启内核生效");
+                                this.restart_core(cx);
+                                this.auto_update_in_flight = None;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.save_profiles();
+                        this.auto_update_in_flight = None;
+                        log_warn!("profile", "订阅自动更新失败（{name}，{host}）：{error:#}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 打开订阅编辑器，回填链接与更新间隔；添加表单和行内编辑互斥。
+    fn edit_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() || self.profile_form_open {
+            return;
+        }
+        let Some(meta) = self.profiles.get(index) else {
+            return;
+        };
+        let Some(url) = meta.url.clone() else {
+            return;
+        };
+        self.editing_profile_index = Some(index);
+        let initial = if meta.update_interval_minutes == 0 {
+            String::new()
+        } else {
+            meta.update_interval_minutes.to_string()
+        };
+        self.profile_edit_url
+            .update(cx, |input, cx| input.set_content(url, cx));
+        self.profile_form_interval
+            .update(cx, |input, cx| input.set_content(initial, cx));
+        self.profile_error = None;
+        cx.notify();
+    }
+
+    /// 保存链接与间隔；全部校验及原子持久化成功后，链接改变才立即更新订阅。
+    fn save_profile_edits(&mut self, cx: &mut Context<Self>) {
+        if self.profile_busy.is_some() || self.auto_update_in_flight.is_some() {
+            return;
+        }
+        let Some(index) = self.editing_profile_index else {
+            return;
+        };
+        let mut profiles = self.profiles.clone();
+        let Some(meta) = profiles.get_mut(index) else {
+            return;
+        };
+        let result = profile::edit_subscription_metadata(
+            meta,
+            self.profile_edit_url.read(cx).content(),
+            self.profile_form_interval.read(cx).content(),
+            profile::now_secs(),
+        );
+        let url_changed = match result {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.profile_error =
+                    Some(t!("profiles.edit_invalid", error = error.to_string()).into_owned());
+                cx.notify();
+                return;
+            }
+        };
+        if let Err(error) = self.commit_profile_metadata(profiles) {
+            // 保留输入和编辑态，用户可重试；不启动下载，也不显示未落盘的新值。
+            log_error!("profile", "保存订阅编辑失败：{error:#}");
+            self.profile_error = Some(t!("profiles.save_failed").into_owned());
+            cx.notify();
+            return;
+        }
+        self.editing_profile_index = None;
+        self.profile_error = None;
+        self.profile_edit_url
+            .update(cx, |input, cx| input.set_content(String::new(), cx));
+        if url_changed {
+            // 保留新地址以便重试；下载或校验失败时原 profile/runtime 仍然可用。
+            log_info!("profile", "订阅链接已修改，立即更新订阅");
+            self.update_profile(index, cx);
+        }
+        cx.notify();
+    }
+
+    /// 取消行内编辑，不落盘；清除链接输入，避免长期保留已放弃的地址。
+    fn cancel_profile_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing_profile_index.take().is_some() {
+            self.profile_edit_url
+                .update(cx, |input, cx| input.set_content(String::new(), cx));
+            self.profile_error = None;
+            cx.notify();
+        }
+    }
+    /// 删除配置；激活中的配置会同时回退到内置默认配置。
+    fn delete_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let Some(meta) = self.profiles.get(index) else {
+            return;
+        };
+        let id = meta.id.clone();
+        let name = meta.name.clone();
+        let was_active = self.active_profile.as_deref() == Some(id.as_str());
+        let previous_content = if was_active {
+            match profile::read_profile(&self.paths, &id) {
+                Ok(content) => Some(content),
+                Err(error) => {
+                    self.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let default_runtime = if was_active {
+            match profile::prepare_runtime(
+                &self.paths,
+                self.baseline.as_ref(),
+                &self.config.mihomo_version,
+                None,
+            ) {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    self.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = profile::delete_profile_file(&self.paths, &id) {
+            self.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+            cx.notify();
+            return;
+        }
+        if let Some(runtime) = default_runtime
+            && let Err(error) = write_runtime(&self.paths, &runtime)
+        {
+            // runtime 提交失败时恢复刚删除的配置，保持激活态和当前内核均不变。
+            let restore_error = previous_content.as_deref().and_then(|content| {
+                crate::platform::file::atomic_write(
+                    &profile::profile_yaml_path(&self.paths, &id),
+                    content.as_bytes(),
+                )
+                .err()
+            });
+            self.profile_error = Some(match restore_error {
+                Some(restore_error) => concise_error(
+                    &format!("{error:#}；恢复原配置也失败：{restore_error:#}"),
+                    240,
+                ),
+                None => concise_error(&format!("{error:#}"), 200),
+            });
+            cx.notify();
+            return;
+        }
+        self.profiles.remove(index);
+        log_info!(
+            "profile",
+            "已删除配置 {name}{}",
+            if was_active {
+                "（激活中，已切回默认配置）"
+            } else {
+                ""
+            }
+        );
+        if was_active {
+            self.active_profile = None;
+            if self.core_active() {
+                self.restart_core(cx);
+            }
+        } else {
+            cx.notify();
+        }
+        self.save_profiles();
+    }
+
+    /// 点击行激活配置：校验合并产物后写入 runtime.yaml，运行中则重启内核。
+    fn activate_profile_clicked(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let Some(meta) = self.profiles.get(index) else {
+            return;
+        };
+        if self.active_profile.as_deref() == Some(meta.id.as_str()) {
+            return;
+        }
+        let id = meta.id.clone();
+        let name = meta.name.clone();
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        self.profile_busy = Some(t!("profiles.busy_activating").into_owned());
+        self.profile_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let id_inner = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let content = profile::read_profile(&paths, &id_inner)?;
+                    let runtime = merge_runtime(&content, &ensure_baseline(&paths)?)?;
+                    validate_kernel_config(&paths, &version, &runtime)?;
+                    Ok::<_, anyhow::Error>((content, runtime))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match result {
+                Ok((_, runtime)) => {
+                    this.profile_busy = None;
+                    match this.apply_runtime(&runtime, cx) {
+                        Ok(()) => {
+                            log_info!("profile", "已激活配置 {name}");
+                            this.active_profile = Some(id);
+                            this.save_profiles();
+                        }
+                        Err(error) => {
+                            log_error!("profile", "激活配置 {name} 时写入 runtime 失败：{error:#}");
+                            this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                            cx.notify();
+                        }
+                    }
+                }
+                Err(error) => {
+                    this.profile_busy = None;
+                    log_error!("profile", "激活配置 {name} 前的校验失败：{error:#}");
+                    this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 切回内置默认配置（仅 DIRECT）：与订阅激活同一条校验链路，成功后记录。
+    fn activate_default_profile(&mut self, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() || self.active_profile.is_none() {
+            return;
+        }
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        self.profile_busy = Some(t!("profiles.busy_activating").into_owned());
+        self.profile_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let default_path = &paths.default_mihomo_config_file;
+                    let content = std::fs::read_to_string(default_path).map_err(|error| {
+                        anyhow::anyhow!("无法读取默认配置 {}: {error}", default_path.display())
+                    })?;
+                    let runtime = merge_runtime(&content, &ensure_baseline(&paths)?)?;
+                    validate_kernel_config(&paths, &version, &runtime)?;
+                    Ok::<_, anyhow::Error>(runtime)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(runtime) => {
+                    this.profile_busy = None;
+                    match this.apply_runtime(&runtime, cx) {
+                        Ok(()) => {
+                            log_info!("profile", "已切回内置默认配置");
+                            // active_profile 记为空即代表默认配置，下次启动同样生效。
+                            this.active_profile = None;
+                            this.save_profiles();
+                        }
+                        Err(error) => {
+                            log_error!("profile", "切回默认配置时写入 runtime 失败：{error:#}");
+                            this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                            cx.notify();
+                        }
+                    }
+                }
+                Err(error) => {
+                    this.profile_busy = None;
+                    log_error!("profile", "切回默认配置前的校验失败：{error:#}");
+                    this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 激活/更新配置后的落地动作：运行中则重启内核让配置真实生效。
+    fn apply_runtime(&mut self, runtime_yaml: &str, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        // 先落地 runtime.yaml，未运行时下次启动直接使用新配置。
+        write_runtime(&self.paths, runtime_yaml)?;
+        if self.core_active() {
+            self.restart_core(cx);
+        } else {
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    /// 添加订阅后按索引激活：补齐激活态并重启内核。
+    fn activate_profile_by_id(
+        &mut self,
+        index: usize,
+        runtime_yaml: String,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.profiles.get(index).map(|meta| meta.id.clone());
+        if let Some(id) = id {
+            match self.apply_runtime(&runtime_yaml, cx) {
+                Ok(()) => {
+                    log_info!("profile", "新配置已激活并按需重启内核");
+                    self.active_profile = Some(id);
+                    self.save_profiles();
+                }
+                Err(error) => {
+                    log_error!("profile", "应用新配置的运行时写入失败：{error:#}");
+                    self.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                    cx.notify();
+                }
+            }
+        }
+    }
+}
+
+impl Render for PureClash {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+        let content = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .text_color(palette.text)
+            .child(render_titlebar(self, palette, window, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(render_sidebar(self, palette, window, cx))
+                    .child(render_page(self, palette, window, cx)),
+            );
+
+        #[cfg(target_os = "linux")]
+        return linux_client_side_decorations(content, palette, window);
+
+        #[cfg(not(target_os = "linux"))]
+        content.into_any_element()
+    }
+}
+fn system_proxy_state_file(paths: &AppPaths) -> std::path::PathBuf {
+    paths.data_dir.join("system-proxy.json")
+}
+
+/// 订阅日志只保留 host（含可选端口），userinfo 与完整 URL 均不进入日志。
+fn host_of_url(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+}
+
+fn save_system_proxy_state(paths: &AppPaths, snapshot: &SystemProxySnapshot) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&paths.data_dir)?;
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    let file = system_proxy_state_file(paths);
+    let temporary = paths.data_dir.join("system-proxy.json.tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(temporary, file)?;
+    Ok(())
+}
+
+fn load_system_proxy_state(paths: &AppPaths) -> Option<SystemProxySnapshot> {
+    let content = std::fs::read_to_string(system_proxy_state_file(paths)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn clear_system_proxy_state(paths: &AppPaths) {
+    let _ = std::fs::remove_file(system_proxy_state_file(paths));
+}
+
+/// 启用系统代理，捕获并返回托管前的用户设置快照。
+fn enable_system_proxy(paths: &AppPaths, server: &str) -> anyhow::Result<()> {
+    let snapshot = capture_system_proxy().inspect_err(|error| {
+        log_error!("proxy", "捕获用户既有系统代理设置失败：{error:#}");
+    })?;
+    // 状态必须先于系统设置落盘；应用在 set_system_proxy 后崩溃时，下次启动
+    // 仍能恢复用户原配置。
+    save_system_proxy_state(paths, &snapshot).inspect_err(|error| {
+        log_error!("proxy", "系统代理托管状态文件落盘失败：{error:#}");
+    })?;
+    if let Err(apply_error) = set_system_proxy(server) {
+        log_error!("proxy", "写入系统代理设置失败：{apply_error:#}");
+        match restore_system_proxy(&snapshot) {
+            Ok(()) => clear_system_proxy_state(paths),
+            Err(restore_error) => {
+                log_error!(
+                    "proxy",
+                    "写入失败后自动恢复原系统代理也失败：{restore_error:#}"
+                );
+                return Err(anyhow::anyhow!(
+                    "{apply_error:#}；自动恢复原系统代理也失败：{restore_error:#}"
+                ));
+            }
+        }
+        return Err(apply_error);
+    }
+    Ok(())
+}
+
+/// 系统代理操作失败的界面文案。
+fn system_proxy_error(error: &anyhow::Error) -> String {
+    t!(
+        "app.system_proxy_failed",
+        error = concise_error(&format!("{error:#}"), 160)
+    )
+    .into_owned()
+}
+
+/// TUN 自动回退时保留可操作的失败原因，但限制长度，避免平台命令输出撑坏横幅。
+fn tun_reverted_error(error: &anyhow::Error) -> String {
+    t!(
+        "app.tun_reverted",
+        error = concise_error(&format!("{error:#}"), 180)
+    )
+    .into_owned()
+}
+
+/// 系统代理 / TUN 操作失败的提示横幅。
+fn order_groups(groups: &mut [GroupSnapshot], order: &[String]) {
+    groups.sort_by_key(|group| {
+        if group.name == "GLOBAL" {
+            (0usize, 0usize)
+        } else {
+            let position = order
+                .iter()
+                .position(|name| name == &group.name)
+                .unwrap_or(usize::MAX);
+            (1usize, position)
+        }
+    });
+}
+
+/// 未手动操作过分组的默认展开规则：单组超过 [`PROXY_AUTO_COLLAPSE_NODES`]
+/// 直接折叠；其余组按显示顺序消耗 [`PROXY_AUTO_EXPAND_NODE_BUDGET`] 节点预算，
+/// 超出后默认折叠，保证代理页初始渲染量有上界，大订阅不再卡死界面。
+fn section_heading(
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    icon_path: &'static str,
+    palette: Palette,
+) -> AnyElement {
+    let title = title.into();
+    let detail = detail.into();
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .size_8()
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(palette.accent_soft)
+                .child(icon(icon_path, palette.accent, 16.0)),
+        )
+        .child(
+            div()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(palette.text)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(palette.muted)
+                        .child(detail),
+                ),
+        )
+        .into_any_element()
+}
+
+fn info_line(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    positive: bool,
+    palette: Palette,
+) -> AnyElement {
+    let label = label.into();
+    let value = value.into();
+    div()
+        .min_h(px(34.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .border_b_1()
+        .border_color(palette.border)
+        .child(div().text_xs().text_color(palette.muted).child(label))
+        .child(
+            div()
+                .text_xs()
+                .text_color(if positive {
+                    palette.success
+                } else {
+                    palette.text
+                })
+                .child(value),
+        )
+        .into_any_element()
+}
+
+fn icon(path: &'static str, color: gpui::Rgba, size: f32) -> AnyElement {
+    gpui::svg()
+        .path(path)
+        .size(px(size))
+        .flex_none()
+        .text_color(color)
+        .into_any_element()
+}
+
+fn tr(key: &'static str) -> SharedString {
+    SharedString::from(t!(key).into_owned())
+}
+
+/// 设置页只展示提交前八位，完整 SHA 仍保存在 Geo 数据状态文件中。
+fn short_revision(revision: &str) -> String {
+    revision.chars().take(8).collect()
+}
+
+fn concise_error(error: &str, max_chars: usize) -> String {
+    let mut concise: String = error.chars().take(max_chars).collect();
+    if error.chars().count() > max_chars {
+        concise.push('…');
+    }
+    concise
+}
+
+/// 字节数人性化展示；超过 1KB 保留一位小数。
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// 实时速度展示：字节数 + `/s` 后缀。
+fn format_speed(bytes_per_second: u64) -> String {
+    format!("{}/s", format_bytes(bytes_per_second))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_formatting_stays_readable_across_scales() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(2516582), "2.4 MB");
+        assert_eq!(format_speed(8_912_896), "8.5 MB/s");
+    }
+
+    #[test]
+    fn locales_cover_core_navigation_and_pages() {
+        assert_eq!(t!("page.overview", locale = "zh-CN"), "概览");
+        assert_eq!(t!("page.overview", locale = "en-US"), "Overview");
+        assert_eq!(
+            t!("connections.detail", locale = "zh-CN"),
+            "实时数据来自 Mihomo controller"
+        );
+        assert_eq!(
+            t!("connections.detail", locale = "en-US"),
+            "Live data from the Mihomo controller"
+        );
+        assert_eq!(
+            t!("app.tun_reverted", locale = "zh-CN", error = "DNS 未接管"),
+            "TUN 启用失败，已自动关闭并重启内核：DNS 未接管"
+        );
+        // 错误类文案必须使用 rust-i18n 的 `%{name}` 语法，不能把占位符原样展示。
+        assert_eq!(
+            t!("about.check_failed", locale = "zh-CN", error = "连接超时"),
+            "检查更新失败：连接超时"
+        );
+        assert_eq!(
+            t!("about.check_failed", locale = "en-US", error = "timed out"),
+            "Update check failed: timed out"
+        );
+        assert_eq!(
+            t!(
+                "settings.geodata_version",
+                locale = "zh-CN",
+                revision = "d2a52e8a",
+                updated = "2026-08-31"
+            ),
+            "版本 d2a52e8a · 更新于 2026-08-31"
+        );
+        assert_eq!(
+            t!(
+                "settings.geodata_update_failed",
+                locale = "en-US",
+                error = "timed out"
+            ),
+            "Geo data update failed: timed out"
+        );
+        assert_eq!(
+            t!(
+                "profiles.import_failed",
+                locale = "zh-CN",
+                error = "配置格式错误"
+            ),
+            "导入本地配置失败：配置格式错误"
+        );
+        assert_eq!(
+            t!(
+                "profiles.import_failed",
+                locale = "en-US",
+                error = "invalid config"
+            ),
+            "Local profile import failed: invalid config"
+        );
+        assert_eq!(
+            t!(
+                "app.system_proxy_failed",
+                locale = "zh-CN",
+                error = "访问被拒绝"
+            ),
+            "系统代理设置失败：访问被拒绝"
+        );
+        assert_eq!(
+            t!(
+                "app.system_proxy_failed",
+                locale = "en-US",
+                error = "access denied"
+            ),
+            "Failed to set system proxy: access denied"
+        );
+    }
+
+    #[test]
+    fn tray_tooltips_cover_locales_and_runtime_states() {
+        let chinese = t!(
+            "tray.tooltip",
+            locale = "zh-CN",
+            core = "运行中",
+            system_proxy = "开启",
+            tun = "关闭"
+        );
+        let english = t!(
+            "tray.tooltip",
+            locale = "en-US",
+            core = "Stopped",
+            system_proxy = "Off",
+            tun = "On"
+        );
+
+        assert_eq!(
+            chinese,
+            "Pure Clash\n内核：运行中\n系统代理：开启\nTUN：关闭"
+        );
+        assert_eq!(
+            english,
+            "Pure Clash\nCore: Stopped\nSystem proxy: Off\nTUN: On"
+        );
+        // Windows NOTIFYICONDATAW 的 szTip 只容纳 128 个 UTF-16 单元，需预留结尾 NUL。
+        assert!(chinese.encode_utf16().count() <= 127);
+        assert!(english.encode_utf16().count() <= 127);
+
+        assert_eq!(t!("tray.menu_open", locale = "zh-CN"), "打开 Pure Clash");
+        assert_eq!(t!("tray.menu_quit", locale = "zh-CN"), "退出");
+        assert_eq!(t!("tray.menu_open", locale = "en-US"), "Open Pure Clash");
+        assert_eq!(t!("tray.menu_quit", locale = "en-US"), "Quit");
+    }
+
+    #[test]
+    fn concise_error_preserves_utf8_boundaries() {
+        assert_eq!(concise_error("启动失败", 2), "启动…");
+        assert_eq!(concise_error("short", 10), "short");
+    }
+
+    #[test]
+    fn subscription_log_host_drops_userinfo_and_path() {
+        assert_eq!(
+            host_of_url("https://user:password@example.com:8443/sub?token=secret"),
+            "example.com:8443"
+        );
+        assert_eq!(host_of_url("https://[::1]:9090/sub"), "[::1]:9090");
+    }
+
+    #[test]
+    fn tun_status_requires_running_core_and_controller_confirmation() {
+        // 授权中、controller 已就绪但网卡仍初始化中都显示过渡态；确认才显示开启。
+        assert_eq!(
+            tun_visible_state(CoreState::Starting, SwitchState::Starting),
+            SwitchState::Starting
+        );
+        assert_eq!(
+            tun_visible_state(CoreState::Running, SwitchState::Starting),
+            SwitchState::Starting
+        );
+        assert_eq!(
+            tun_visible_state(CoreState::Running, SwitchState::On),
+            SwitchState::On
+        );
+        assert_eq!(
+            tun_visible_state(CoreState::Starting, SwitchState::On),
+            SwitchState::Starting
+        );
+        // 失败回退和手动停止后，即使有过期状态也不得卡在启动中或显示已开启。
+        for state in [SwitchState::Off, SwitchState::Starting, SwitchState::On] {
+            assert_eq!(
+                tun_visible_state(CoreState::Stopped, state),
+                SwitchState::Off
+            );
+        }
+        assert_eq!(
+            tun_visible_state(CoreState::Running, SwitchState::Off),
+            SwitchState::Off
+        );
+        assert_eq!(t!("status.starting", locale = "zh-CN"), "启动中…");
+        assert_eq!(t!("status.starting", locale = "en-US"), "Starting…");
+    }
+
+    #[test]
+    fn autostart_elevation_policy_matches_platform_service_model() {
+        assert!(startup_allows_interactive_elevation(
+            StartupMode::Interactive
+        ));
+        #[cfg(target_os = "windows")]
+        assert!(startup_allows_interactive_elevation(StartupMode::Autostart));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!startup_allows_interactive_elevation(
+            StartupMode::Autostart
+        ));
+    }
+}
