@@ -1,0 +1,39 @@
+{
+  "version": "1.19.32",
+  "source_url": "https://github.com/MetaCubeX/mihomo/tree/v1.19.32",
+  "license": "GPL-3.0",
+  "license_url": "https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.32/LICENSE",
+  "license_sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+  "targets": {
+    "windows-amd64": {
+      "platform": "windows",
+      "architecture": "amd64",
+      "build": "compatible",
+      "binary": "pc-mihomo.exe",
+      "archive": "mihomo-windows-amd64-compatible-v1.19.32.zip",
+      "archive_size": 22525067,
+      "archive_sha256": "974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0",
+      "binary_size": 61276672,
+      "binary_sha256": "04f8d7fc2b314771e1ecbf15951d59f0e1cb7914503c88cfb6972ff6a824e314",
+      "wintun": {
+        "version": "0.14.1",
+        "file": "wintun.dll",
+        "source_url": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+        "archive_sha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+        "file_size": 427552,
+        "file_sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+      }
+    },
+    "linux-amd64": {
+      "platform": "linux",
+      "architecture": "amd64",
+      "build": "default",
+      "binary": "pc-mihomo",
+      "archive": "mihomo-linux-amd64-v1.19.32.gz",
+      "archive_size": 22846526,
+      "archive_sha256": "8451100836c9eda194331c2babfad490b2faf30cebc1a04b0e76fd8ac2d35d10",
+      "binary_size": 61993086,
+      "binary_sha256": "3122d100e8177501776109f1a6253a694611627cf4d7c7ec82705855cf8626a8"
+    }
+  }
+}
